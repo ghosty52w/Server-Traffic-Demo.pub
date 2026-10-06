@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Server Traffic</title>
+  <meta name="description" content="Live view of requests flowing into self-hosted sites, how much each site uses, and how hard each server is working." />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="3" y="3.5" width="18" height="7" rx="2" />
+        <rect x="3" y="13.5" width="18" height="7" rx="2" />
+        <circle cx="7" cy="7" r="1.2" class="led" />
+        <circle cx="7" cy="17" r="1.2" class="led" />
+      </svg>
+      <div>
+        <h1>Server Traffic</h1>
+        <p>Demo · simulated visitors</p>
+      </div>
+    </div>
+
+    <div class="controls">
+      <div class="clock" title="Simulated time of day — traffic follows daily patterns (lunch rush, school hours, evening gaming)">
+        <span class="control-label">Time of day</span>
+        <strong id="clock">--:--</strong>
+      </div>
+      <div class="seg" role="group" aria-label="Clock speed">
+        <button type="button" data-speed="1" aria-pressed="true">1 min/s</button>
+        <button type="button" data-speed="5" aria-pressed="false">5 min/s</button>
+        <button type="button" data-speed="20" aria-pressed="false">20 min/s</button>
+      </div>
+      <button type="button" id="playPause" class="btn">Pause</button>
+      <button type="button" id="rush" class="btn btn-strong" title="Every site gets about 2.5× busier for 20 seconds">Rush hour</button>
+      <button type="button" id="theme" class="btn btn-icon" aria-label="Switch colour theme">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" /></svg>
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <section class="kpis" aria-label="Totals across all servers">
+      <div class="kpi kpi-hero">
+        <span class="kpi-label">Requests per second</span>
+        <div class="kpi-hero-row">
+          <strong id="kpiRps" class="kpi-value">0</strong>
+          <svg id="kpiSpark" class="kpi-spark" aria-hidden="true"></svg>
+        </div>
+        <span class="kpi-sub">all sites · last 60 s</span>
+      </div>
+      <div class="kpi">
+        <span class="kpi-label">Visitors online</span>
+        <strong id="kpiVisitors" class="kpi-value">0</strong>
+        <span class="kpi-sub">estimated from traffic</span>
+      </div>
+      <div class="kpi">
+        <span class="kpi-label">Bandwidth out</span>
+        <strong id="kpiNet" class="kpi-value">0</strong>
+        <span class="kpi-sub">data sent to visitors</span>
+      </div>
+      <div class="kpi">
+        <span class="kpi-label">Requests served</span>
+        <strong id="kpiServed" class="kpi-value">0</strong>
+        <span class="kpi-sub">since you opened this page</span>
+      </div>
+      <div class="kpi">
+        <span class="kpi-label">Failed requests</span>
+        <strong id="kpiErrors" class="kpi-value">0</strong>
+        <span class="kpi-sub" id="kpiErrorsSub">last 60 s</span>
+      </div>
+      <div class="kpi">
+        <span class="kpi-label">Busiest site</span>
+        <strong id="kpiBusiest" class="kpi-value kpi-text">–</strong>
+        <span class="kpi-sub" id="kpiBusiestSub">&nbsp;</span>
+      </div>
+    </section>
+
+    <section class="card flow-card">
+      <div class="card-head">
+        <div>
+          <h2>Live traffic</h2>
+          <p>Each dot is a request going from a visitor, through your router, to a server and the site it asked for. Red dots bounce off a server that is too busy to answer.</p>
+        </div>
+        <span id="dotScale" class="chip">1 dot = 1 request</span>
+      </div>
+      <div class="flow-scroll">
+        <svg id="flow" role="img" aria-label="Diagram of requests flowing from visitors through the router to each server and site"></svg>
+      </div>
+      <p class="scroll-hint">Swipe sideways to see the whole map →</p>
+    </section>
+
+    <section id="servers" class="servers" aria-label="Servers"></section>
+
+    <section class="card log-card">
+      <div class="card-head">
+        <div>
+          <h2>Request log</h2>
+          <p>A sample of individual requests as they arrive.</p>
+        </div>
+        <label class="select">
+          <span class="control-label">Show</span>
+          <select id="logFilter">
+            <option value="all">All sites</option>
+            <option value="errors">Errors only</option>
+          </select>
+        </label>
+      </div>
+      <div class="table-scroll">
+        <table class="log">
+          <thead>
+            <tr>
+              <th scope="col">Time</th>
+              <th scope="col">Visitor</th>
+              <th scope="col">Site</th>
+              <th scope="col">Request</th>
+              <th scope="col">Status</th>
+              <th scope="col" class="num">Took</th>
+              <th scope="col" class="num">Size</th>
+            </tr>
+          </thead>
+          <tbody id="logBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer class="foot">
+      All traffic on this page is simulated. Edit <code>config.js</code> to describe your own servers and sites.
+    </footer>
+  </main>
+
+  <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+
+  <script src="config.js"></script>
+  <script src="simulator.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
