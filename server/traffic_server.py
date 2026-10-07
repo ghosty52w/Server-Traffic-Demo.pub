@@ -10,6 +10,10 @@ a folder and it shows up on (or leaves) the dashboard within a second.
     python3 server/traffic_server.py            # port 8080
     python3 server/traffic_server.py --port 9000
 
+Requests are served by one process per CPU core, so real traffic can use the
+whole machine. A load test floods the sites with real HTTP requests sent from
+this machine itself.
+
 Then open http://<this-device's-ip>:8080/ from any device on the same network.
 Only the Python standard library is used, so it runs as-is in Termux on Android,
 on a Raspberry Pi, or on a PC.
@@ -17,9 +21,11 @@ on a Raspberry Pi, or on a PC.
 import argparse
 import email.utils
 import glob
+import http.client
 import json
 import mimetypes
 import os
+import re
 import shutil
 import signal
 import socket
@@ -29,7 +35,7 @@ import time
 import warnings
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -50,8 +56,9 @@ RATE_WINDOW = 3.0  # seconds of requests averaged into "per second" numbers
 VISITOR_WINDOW = 300.0  # an IP counts as "online" for 5 minutes after its last request
 LOG_SIZE = 400
 LOAD_TEST_MAX_SECONDS = 60
+LOAD_TEST_AGENT = "traffic-loadtest"  # User-Agent of load test requests
 
-# Forking from the threaded server is fine here: children only run a CPU loop and exit.
+# Load generators are forked from the threaded server; they only send HTTP requests and exit.
 warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*fork.*")
 
 
@@ -156,14 +163,34 @@ class TempReader:
 
 # ---------------------------------------------------------------- load test
 
-def burn_cpu(deadline, parent_pid):
-    """Keep one CPU core 100% busy until the deadline, or until the server exits."""
-    x = 1
+def generate_requests(host, port, targets, deadline, parent_pid):
+    """
+    Loads the sites over real HTTP, like a browser would (page, then its CSS/JS/images),
+    as fast as the server answers, until the deadline or until the server exits.
+    """
+    conn = None
+    i = 0
     while time.time() < deadline:
-        for _ in range(100_000):
-            x = (x * 1103515245 + 12345) & 0x7FFFFFFF
-        if os.getppid() != parent_pid:
+        url, referer = targets[i % len(targets)]
+        i += 1
+        try:
+            if conn is None:
+                conn = http.client.HTTPConnection(host, port, timeout=10)
+            conn.request("GET", url, headers={"User-Agent": LOAD_TEST_AGENT, "Referer": referer})
+            conn.getresponse().read()
+            if i % 100 == 0:  # reconnect now and then so every server process gets work
+                conn.close()
+                conn = None
+        except (OSError, http.client.HTTPException):
+            if conn:
+                conn.close()
+            conn = None
+            time.sleep(0.05)
+        if i % 200 == 0 and os.getppid() != parent_pid:
             break
+
+
+CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 
 
 def read_pid_cpu_seconds(pid):
@@ -175,25 +202,45 @@ def read_pid_cpu_seconds(pid):
         return None
 
 
-CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+class PidCpu:
+    """CPU time used by a set of child processes since the previous call."""
+
+    def __init__(self):
+        self.prev = {}
+
+    def since_last(self, pids, dt, assume_busy=False):
+        total = 0.0
+        seen = {}
+        for pid in pids:
+            t = read_pid_cpu_seconds(pid)
+            if t is None:  # no /proc (macOS, Windows)
+                total += dt if assume_busy else 0
+                continue
+            total += max(0.0, t - self.prev.get(pid, 0.0))
+            seen[pid] = t
+        self.prev = seen
+        return total
 
 
 class LoadTest:
     """
-    Pushes this machine to its CPU limit: one busy worker process per core.
-    Python's GIL means request handling alone can only fill about one core, so
-    real HTTP load from browsers runs alongside this to show its effect on the sites.
+    Floods sites with real HTTP requests from this machine: two request-sending
+    processes per CPU core. Sending and serving them (on every core) is what pushes
+    the CPU to its limit, so the device really heats up.
     """
 
     def __init__(self, cores):
         self.cores = cores
+        self.host = "127.0.0.1"
+        self.port = None  # set when the server starts
+        self.targets_for = None  # site ids -> [(url, referer)], set by App
         self.lock = threading.Lock()
         self.workers = []
         self.sites = []
         self.until = 0.0
         self.note = None
         self.note_at = 0.0
-        self.prev_cpu = {}
+        self.cpu = PidCpu()
         self.generation = 0
 
     def active(self):
@@ -202,12 +249,16 @@ class LoadTest:
     def start(self, site_ids, seconds):
         seconds = max(1.0, min(float(LOAD_TEST_MAX_SECONDS), seconds))
         with self.lock:
-            self.sites = sorted(set(self.sites if self.workers else []) | set(site_ids))
-            self.note = None
             if self.workers:
-                return  # already running: just count these sites in
+                return  # one load test at a time
+            self.sites = sorted(set(site_ids))
+            self.note = None
+            targets = self.targets_for(self.sites)
+            if not targets:
+                return
             self.until = time.time() + seconds
-            self.workers = [self._spawn(self.until) for _ in range(self.cores)]
+            # Two senders per core keep every core busy even while some wait on responses.
+            self.workers = [self._spawn(targets, self.until) for _ in range(self.cores * 2)]
             self.generation += 1
             gen, workers = self.generation, list(self.workers)
         threading.Thread(target=self._reap, args=(gen, workers), daemon=True).start()
@@ -227,18 +278,18 @@ class LoadTest:
             except (OSError, AttributeError):
                 pass
 
-    def _spawn(self, deadline):
+    def _spawn(self, targets, deadline):
         parent = os.getpid()
         if hasattr(os, "fork"):
             pid = os.fork()
             if pid == 0:
                 try:
-                    burn_cpu(deadline, parent)
+                    generate_requests(self.host, self.port, targets, deadline, parent)
                 finally:
                     os._exit(0)
             return pid
         import multiprocessing  # Windows has no fork
-        p = multiprocessing.Process(target=burn_cpu, args=(deadline, parent), daemon=True)
+        p = multiprocessing.Process(target=generate_requests, args=(self.host, self.port, targets, deadline, parent), daemon=True)
         p.start()
         return p
 
@@ -253,22 +304,13 @@ class LoadTest:
                 pass
         with self.lock:
             if self.generation == gen:
-                self.workers, self.sites, self.prev_cpu = [], [], {}
+                self.workers, self.sites = [], []
 
     def cpu_seconds_since_last(self, dt):
-        """CPU time the workers used since the previous call."""
+        """CPU time the request generators used since the previous call."""
         with self.lock:
-            workers = list(self.workers)
-        total = 0.0
-        for w in workers:
-            pid = w if isinstance(w, int) else w.pid
-            t = read_pid_cpu_seconds(pid)
-            if t is None:  # no /proc (e.g. macOS, Windows): assume a full core while running
-                total += dt if time.time() < self.until else 0
-                continue
-            total += max(0.0, t - self.prev_cpu.get(pid, 0.0))
-            self.prev_cpu[pid] = t
-        return total
+            pids = [w if isinstance(w, int) else w.pid for w in self.workers]
+        return self.cpu.since_last(pids, dt, assume_busy=time.time() < self.until)
 
     def status(self):
         now = time.time()
@@ -277,7 +319,7 @@ class LoadTest:
             return {
                 "sites": list(self.sites) if running else [],
                 "remaining": max(0.0, self.until - now) if running else 0,
-                "workers": len(self.workers) if running else 0,
+                "generators": len(self.workers) if running else 0,
                 "note": self.note if self.note and now - self.note_at < 60 else None,
             }
 
@@ -300,19 +342,20 @@ class Metrics:
         self.seq = 0
         self.bytes_sent = 0
 
-    def record(self, site_id, ip, method, path, status, ms, nbytes, cpu):
+    def record(self, site_id, ip, method, path, status, ms, nbytes, cpu, agent=None):
         now = time.time()
         with self.lock:
             st = self.stats.get(site_id) or self.stats.setdefault(site_id, SiteStats())
             st.events.append((now, nbytes, ms, status, cpu))
             st.total += 1
-            st.visitors[ip] = now
+            if agent != "loadtest":  # load test requests aren't people
+                st.visitors[ip] = now
             st.recent_ms.append(ms)
             self.bytes_sent += nbytes
             self.seq += 1
             self.log.append({
                 "seq": self.seq, "t": now, "siteId": site_id, "ip": ip, "method": method,
-                "path": path, "status": status, "ms": round(ms, 1), "bytes": nbytes,
+                "path": path, "status": status, "ms": round(ms, 1), "bytes": nbytes, "agent": agent,
             })
 
     def sites_now(self, cores, site_ids):
@@ -425,10 +468,12 @@ class SiteRegistry:
 class DeviceSampler(threading.Thread):
     """Samples CPU / memory / network / temperature once a second."""
 
-    def __init__(self, metrics, load_test):
+    def __init__(self, metrics, load_test, server_pids=()):
         super().__init__(daemon=True)
         self.metrics = metrics
         self.load_test = load_test
+        self.server_pids = list(server_pids)  # worker processes serving requests
+        self.server_cpu = PidCpu()
         self.cores = load_test.cores
         self.temp = TempReader()
         # Battery sensors run much cooler than CPU sensors, so they get lower limits.
@@ -442,7 +487,7 @@ class DeviceSampler(threading.Thread):
         self.net_scope = "device" if self.prev_tx is not None else "process"
         mem = read_meminfo()
         self.ram_total = mem[0] if mem else None
-        self.latest = {"cpu": 0, "burn": 0, "ramMB": mem[1] if mem else None, "netMbps": 0, "temp": self.temp.read()}
+        self.latest = {"cpu": 0, "loadgen": 0, "ramMB": mem[1] if mem else None, "netMbps": 0, "temp": self.temp.read()}
 
     def run(self):
         while True:
@@ -467,13 +512,15 @@ class DeviceSampler(threading.Thread):
             else:
                 cpu = self.latest["cpu"]
         else:
+            # Device CPU is hidden: add up this program's processes instead.
             proc = process_cpu_seconds()
-            cpu = (proc - self.prev_proc) / dt / self.cores * 100
+            busy = proc - self.prev_proc + self.server_cpu.since_last(self.server_pids, dt)
+            cpu = busy / dt / self.cores * 100
             self.prev_proc = proc
 
-        burn = self.load_test.cpu_seconds_since_last(dt) / dt / self.cores * 100
+        loadgen = self.load_test.cpu_seconds_since_last(dt) / dt / self.cores * 100
         if self.cpu_scope == "process":
-            cpu += burn  # worker processes aren't part of this process's own CPU time
+            cpu += loadgen
 
         own = self.metrics.bytes_sent
         sent = own - self.prev_own  # what our sites sent
@@ -492,7 +539,7 @@ class DeviceSampler(threading.Thread):
             print(f"Load test stopped: temperature {temp:.0f} °C")
         self.latest = {
             "cpu": max(0.0, min(100.0, cpu)),
-            "burn": max(0.0, min(100.0, burn)),
+            "loadgen": max(0.0, min(100.0, loadgen)),
             "ramMB": mem[1] if mem else None,
             "netMbps": max(0, sent) * 8 / dt / 1e6,
             "temp": temp,
@@ -505,9 +552,19 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "TrafficServer/1.0"
     protocol_version = "HTTP/1.1"
     app = None  # set in main()
+    api_port = None  # in worker processes: the main process's internal API port
 
     def log_message(self, *args):
         pass  # requests go to the dashboard instead of the terminal
+
+    def setup(self):
+        super().setup()
+        # Headers and body are written separately; without this, small responses
+        # wait ~40 ms for a TCP acknowledgement (Nagle's algorithm).
+        try:
+            self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
 
     def do_GET(self):
         self.handle_request()
@@ -525,9 +582,10 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(url.path)
         site_id, status, nbytes = self.dispatch(url, path)
         shown = url.path + ("?" + url.query if url.query else "")
+        agent = "loadtest" if self.headers.get("User-Agent") == LOAD_TEST_AGENT else None
         self.app.metrics.record(
             site_id, self.client_address[0], self.command, shown[:160], status,
-            (time.perf_counter() - t0) * 1000, nbytes, time.thread_time() - cpu0,
+            (time.perf_counter() - t0) * 1000, nbytes, time.thread_time() - cpu0, agent,
         )
 
     def dispatch(self, url, path):
@@ -591,6 +649,8 @@ class Handler(BaseHTTPRequestHandler):
     # -- API
 
     def api(self, path, query):
+        if self.api_port:
+            return self.relay_api()
         app = self.app
         if path == "/api/config":
             return self.send_json(app.config_payload(self.headers.get("Host") or ""))
@@ -618,6 +678,20 @@ class Handler(BaseHTTPRequestHandler):
                 since = 0
             return self.send_json(app.snapshot(since))
         return self.send_text(404, "Not found")
+
+    def relay_api(self):
+        """Worker processes pass API calls to the main process, which holds the numbers."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.api_port, timeout=10)
+        try:
+            conn.request(self.command, self.path, headers={"Host": self.headers.get("Host") or ""})
+            res = conn.getresponse()
+            body = res.read()
+            return self.send_bytes(res.status, body, res.getheader("Content-Type") or "application/json",
+                                   {"Cache-Control": "no-store"})
+        except (OSError, http.client.HTTPException):
+            return self.send_text(503, "Busy")
+        finally:
+            conn.close()
 
     # -- responses (each returns (status, body bytes sent))
 
@@ -670,6 +744,57 @@ class Handler(BaseHTTPRequestHandler):
         return status, 0
 
 
+class InternalApiHandler(Handler):
+    """The main process's API endpoint for worker processes (not counted as traffic itself)."""
+
+    def handle_request(self):
+        url = urlsplit(self.path)
+        self.api(unquote(url.path), url.query)
+
+
+class PipeRecorder:
+    """Worker processes send each request record to the main process through a pipe."""
+
+    def __init__(self, fd):
+        self.fd = fd
+
+    def record(self, *fields):
+        line = json.dumps(fields).encode() + b"\n"  # well under PIPE_BUF, so writes don't interleave
+        try:
+            os.write(self.fd, line)
+        except OSError:
+            os._exit(0)  # main process is gone
+
+
+def read_records(fd, metrics):
+    with os.fdopen(fd, "rb", buffering=1 << 16) as f:
+        for line in f:
+            try:
+                metrics.record(*json.loads(line))
+            except (ValueError, TypeError):
+                pass
+
+
+def run_worker(app, server, record_fd, api_port):
+    """Body of a request-serving worker process. Never returns."""
+    app.metrics = PipeRecorder(record_fd)
+    Handler.api_port = api_port
+    parent = os.getppid()
+
+    def watch_parent():
+        while os.getppid() == parent:
+            time.sleep(1)
+        os._exit(0)
+
+    threading.Thread(target=watch_parent, daemon=True).start()
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        os._exit(0)
+
+
 class App:
     def __init__(self, conf_path, sites_dir):
         try:
@@ -677,12 +802,48 @@ class App:
                 self.server_conf = json.load(f)
         except FileNotFoundError:
             self.server_conf = {}
+        self.cores = os.cpu_count() or 1
         self.registry = SiteRegistry(sites_dir)
         self.metrics = Metrics()
-        self.load_test = LoadTest(os.cpu_count() or 1)
-        self.sampler = DeviceSampler(self.metrics, self.load_test)
+        self.load_test = LoadTest(self.cores)
+        self.load_test.targets_for = self.load_test_targets
+        self.sampler = None
+
+    def start(self, host, port, server_pids=(), record_fd=None):
+        """Starts background threads. Called after worker processes are forked."""
+        self.load_test.host = "127.0.0.1" if host in ("", "0.0.0.0", "::") else host
+        self.load_test.port = port
+        self.sampler = DeviceSampler(self.metrics, self.load_test, server_pids)
         self.sampler.start()
         threading.Thread(target=self._watch_sites, daemon=True).start()
+        if record_fd is not None:
+            threading.Thread(target=read_records, args=(record_fd, self.metrics), daemon=True).start()
+
+    def load_test_targets(self, site_ids):
+        """Each site's page plus the files it links to, like a browser loading it."""
+        targets = []
+        for sid in site_ids:
+            if sid == TRAFFIC_SITE:
+                base, index = "/", os.path.join(REPO, "index.html")
+            else:
+                site = self.registry.get(sid)
+                if not site:
+                    continue
+                base, index = f"/{quote(sid)}/", os.path.join(site["root"], "index.html")
+            urls = [base]
+            try:
+                with open(index, encoding="utf-8", errors="ignore") as f:
+                    html = f.read()
+            except OSError:
+                html = ""
+            for ref in re.findall(r"""(?:src|href)\s*=\s*["']([^"'#?]+)""", html, re.I):
+                if re.match(r"^([a-z][a-z0-9+.-]*:|//)", ref, re.I):
+                    continue  # other websites, mailto:, data: ...
+                url = urljoin(base, ref)
+                if url not in urls:
+                    urls.append(url)
+            targets += [(quote(u, safe="/%:@&=+$,;~-._!*'()"), base) for u in urls[:30]]
+        return targets
 
     def _watch_sites(self):
         while True:  # notices new/removed folders even when no dashboard is open
@@ -741,8 +902,8 @@ class App:
         dev = s.latest
         sites = self.metrics.sites_now(s.cores, self.site_ids())
         test = self.load_test.status()
-        if test["sites"]:  # count the load test's CPU against the sites being tested
-            share = dev["burn"] / len(test["sites"])
+        if test["sites"]:  # count the request generators' CPU against the sites being tested
+            share = dev["loadgen"] / len(test["sites"])
             for x in sites:
                 if x["id"] in test["sites"]:
                     x["cpu"] += share
@@ -792,12 +953,35 @@ def main():
     parser.add_argument("--host", default="0.0.0.0", help="address to listen on (default: all)")
     parser.add_argument("--config", default=os.path.join(HERE, "server.json"), help="server name and specs")
     parser.add_argument("--sites", default=os.path.join(REPO, "sites"), help="folder whose sub-folders are the sites")
+    parser.add_argument("--workers", type=int, default=0, help="request-serving processes (default: one per core)")
     args = parser.parse_args()
 
     app = App(args.config, args.sites)
     Handler.app = app
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
-    httpd.daemon_threads = True
+    public = ThreadingHTTPServer((args.host, args.port), Handler)
+    public.daemon_threads = True
+    workers = []
+
+    if hasattr(os, "fork"):
+        # Fork the serving processes before any threads start. They share the listening
+        # socket, so the kernel spreads connections across every CPU core.
+        internal = ThreadingHTTPServer(("127.0.0.1", 0), InternalApiHandler)
+        internal.daemon_threads = True
+        read_fd, write_fd = os.pipe()
+        for _ in range(args.workers or app.cores):
+            pid = os.fork()
+            if pid == 0:
+                os.close(read_fd)
+                internal.socket.close()
+                run_worker(app, public, write_fd, internal.server_address[1])
+            workers.append(pid)
+        os.close(write_fd)
+        public.socket.close()  # only the workers accept site traffic
+        app.start(args.host, args.port, workers, read_fd)
+        threading.Thread(target=internal.serve_forever, daemon=True).start()
+    else:
+        app.start(args.host, args.port)  # Windows: a single process serves everything
+        threading.Thread(target=public.serve_forever, daemon=True).start()
 
     base = f"http://{lan_ip()}:{args.port}"
 
@@ -814,14 +998,21 @@ def main():
         print(f"  {site['name']:<14} {base}/{quote(site['id'])}/")
     print(f"\n  Sites folder: {app.registry.dir}")
     print("  Every folder in it is a site named after the folder. Changes show up within a second.")
-    print(f"\n  CPU: {'whole device' if s.cpu_scope == 'device' else 'this server process (device CPU is hidden)'}"
-          f" · network: {'whole device' if s.net_scope == 'device' else 'this server only'}"
+    print(f"\n  Serving with {len(workers) or 1} process(es) on {app.cores} cores"
+          f" · CPU: {'whole device' if s.cpu_scope == 'device' else 'this program (device CPU is hidden)'}"
+          f" · network: {'whole device' if s.net_scope == 'device' else 'this program only'}"
           f" · temperature: {s.temp.kind or 'not available'}")
     print("  Press Ctrl+C to stop.\n")
     try:
-        httpd.serve_forever()
+        while True:
+            time.sleep(3600)
     except KeyboardInterrupt:
         app.load_test.stop()
+        for pid in workers:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
         print("\nStopped.")
 
 

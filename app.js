@@ -468,7 +468,7 @@
   const pool = [];
   const spawnDebt = new Map();
   let dotScale = 1;
-  const SCALES = [1, 2, 5, 10, 20, 50, 100];
+  const SCALES = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
 
   function updateDotScale() {
     const total = totalHistory.at(-1) || 0;
@@ -593,7 +593,7 @@
         type: "button",
         class: "spike",
         title: LIVE
-          ? `Max out every CPU core on ${server.name} and send real requests to ${site.name} for 15 s`
+          ? `Flood ${site.name} with real requests for 15 s, sent from ${server.name} itself and this browser`
           : `Max out ${server.name}'s CPU and send ${site.name} 6× its traffic for 15 s`,
         text: SPIKE_LABEL[0],
         onclick: () => {
@@ -771,10 +771,14 @@
         ref.alert.hidden = false;
         setLevel(ref.alertGlyph, lvl);
         ref.alertGlyph.textContent = STATUS[lvl].glyph;
-        ref.alertText.textContent = testing
-          ? `Load test running — pushing all ${server.cores} CPU cores to the limit` +
-            (test && test.remaining ? ` (${Math.ceil(test.remaining)} s left).` : ".")
-          : test.note;
+        const left = test && test.remaining ? ` (${Math.ceil(test.remaining)} s left)` : "";
+        ref.alertText.textContent = !testing
+          ? test.note
+          : LIVE
+            ? `Load test running — ${fmt.int(sum(st.sites, (x) => x.rps))} real requests per second, ` +
+              `sent from ${test && test.generators ? test.generators + " processes on the server" : "this browser"} ` +
+              `and served on all ${server.cores} cores${left}.`
+            : `Load test running — pushing all ${server.cores} CPU cores to the limit${left}.`;
       } else if (health.overall >= 2) {
         ref.alert.hidden = false;
         setLevel(ref.alertGlyph, health.overall);
@@ -1012,7 +1016,7 @@
     );
     const tr = h("tr", { class: "fresh" + (r.status >= 500 ? " err" : "") },
       h("td", { text: fmt.clock(r.clock, true) }),
-      h("td", { class: "mono", text: r.ip }),
+      h("td", { class: "mono", text: r.agent === "loadtest" ? "⚡ load test" : r.ip }),
       h("td", null, h("span", { class: "site-cell", style: `--c:${site.color}` }, h("i"), site.name)),
       h("td", { class: "mono path" }, h("span", { class: "method", text: r.method }), r.path),
       h("td", null, statusCell),
@@ -1123,7 +1127,7 @@
     // Real data: no pretend controls, and the page explains where numbers come from.
     $("modeLabel").textContent = "Live · real visitors";
     document.body.classList.add("live");
-    $("rush").title = "Max out every CPU core on every server and send real requests to every site for 15 s";
+    $("rush").title = "Flood every site with real requests for 15 s";
     $("kpiVisitorsSub").textContent = "devices seen in the last 5 min";
     $("flowHelp").textContent =
       "Each dot is a real request: a device on your network (or the internet) asking for a page. " +

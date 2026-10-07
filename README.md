@@ -78,13 +78,20 @@ Every folder in `sites/` is a site, named after the folder:
 
 ### Load test
 
-**⚡ Load test** on a site (or **Load test all**) pushes the server to its CPU limit for 15 seconds:
+**⚡ Load test** on a site (or **Load test all**) floods it with **real HTTP requests** for 15 seconds:
 
-- The server starts one CPU-burning worker process per core, so every core runs at 100%.
-- At the same time your browser keeps requesting the site, so you can see how slow it gets under full load.
+- The server starts two request-sending processes per CPU core. They load the site the way a browser
+  does (the page, then the CSS, JavaScript and images it links to) over and over.
+- Requests are served by one server process per core, so sending and serving them uses every core.
+  The CPU goes to (close to) 100% and the phone gets warm.
+- Your browser sends real requests to the site at the same time.
+- Every request is counted on the dashboard. In the request log, the generated ones show
+  **⚡ load test** as the visitor, and they don't count as visitors online.
 - Click **■ Stop** to end it early. It also stops by itself after 15 s (60 s at most), when the server
   is stopped, or when the temperature reaches the limit shown on the Temperature meter (if the device
   has a readable sensor).
+
+On a 4-core test machine this reached about 95% CPU at 5,000–8,500 requests per second.
 
 ### What's real and what Android hides
 
@@ -131,7 +138,7 @@ temperature and failed requests (`healthOf()` in `app.js`).
 
 | File | Purpose |
 | --- | --- |
-| `server/traffic_server.py` | **Live mode.** Hosts the sites, records requests, measures the device, serves the dashboard and `/api/snapshot`. Python standard library only. |
+| `server/traffic_server.py` | **Live mode.** Hosts the sites (one serving process per core), records requests, measures the device, runs load tests, serves the dashboard and `/api/snapshot`. Python standard library only. |
 | `server/server.json` | The live server's name and specs |
 | `sites/` | **Your sites**: every folder in here is hosted and shown on the dashboard |
 | `live.js` | Picks live or demo data, starts and stops load tests, picks up site changes |

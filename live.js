@@ -61,8 +61,8 @@
     }
 
     /**
-     * Load test: the server runs one CPU-burning worker per core (100% CPU),
-     * and this browser keeps requesting the site so you see how it copes.
+     * Load test: the server floods the site with real HTTP requests from one
+     * process per core, and this browser sends real requests too.
      */
     spike(siteId) {
       this.startTest([siteId]);
@@ -97,7 +97,7 @@
       }
     }
 
-    /** Stops the load test (the server's CPU workers are shared by all sites). */
+    /** Stops the load test (one load test runs at a time, covering all its sites). */
     stop() {
       fetch("api/loadtest?seconds=0", { method: "POST" }).catch(() => {});
       this.tests.clear();
