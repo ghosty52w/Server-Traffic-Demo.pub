@@ -3,8 +3,12 @@
 A live dashboard for a small self-hosted setup. You can see visitors' requests flowing to each site,
 what each site uses, and how hard each server is working.
 
-All traffic is **simulated** for now. The page is built so the fake data source can be swapped for
-real metrics later.
+It runs in two modes:
+
+- **Live:** `server/traffic_server.py` hosts your sites, records every real request and measures the
+  machine. The dashboard it serves shows real traffic.
+- **Demo:** open `index.html` anywhere else and it uses simulated traffic (three made-up servers).
+  Add `?demo` to a live URL to force the demo.
 
 ```
 Visitors ──► Router ──► Server 1 (Raspberry Pi 4) ──► Chess · School · Restaurant
@@ -12,16 +16,71 @@ Visitors ──► Router ──► Server 1 (Raspberry Pi 4) ──► Chess ·
                     └─► Server 3 (Old laptop)      ──► Blog · Minecraft Map
 ```
 
-## Running it
+## Run it for real on an Android phone (Termux)
 
-Open `index.html` in a browser. It has no build step, no dependencies and no server.
+1. Install **Termux** from F-Droid or GitHub (the Play Store version is outdated). Open it, or SSH into
+   it (`ssh -p 8022 <phone-ip>`), then run:
 
-To serve it on your network instead (for example from the Pi):
+   ```sh
+   pkg update && pkg install -y python git
+   git clone -b claude/traffic-dashboard-demo-kbd1za https://github.com/ghosty52w/Server-Traffic-Demo.pub.git
+   cd Server-Traffic-Demo.pub
+   termux-wake-lock          # stops Android pausing Termux when the screen turns off
+   python server/traffic_server.py
+   ```
+
+2. It prints the addresses, for example:
+
+   ```
+     Dashboard   http://192.168.1.119:8080/
+     Chess       http://192.168.1.119:8080/chess/
+     School      http://192.168.1.119:8080/school/
+     Restaurant  http://192.168.1.119:8080/restaurant/
+   ```
+
+3. Open the dashboard on any device on the same Wi-Fi. Then open a site on another device, or click
+   a site in the dashboard: each page load shows up as dots, numbers and log rows within about a second.
+   **⚡ Load test** makes your browser send real requests to a site for 15 seconds.
+
+To keep it running after you close the SSH session:
 
 ```sh
-python3 -m http.server 8080
-# then open http://<pi-address>:8080
+nohup python server/traffic_server.py > traffic.log 2>&1 &
 ```
+
+Optional: install the **Termux:API** app and `pkg install termux-api` to get the battery temperature.
+
+The same command works on a Raspberry Pi or PC (`python3 server/traffic_server.py`). There it can
+also read whole-machine CPU, memory, network and temperature.
+
+### Your own sites
+
+Sites are folders of static files listed in `server/sites.json`:
+
+```json
+{ "id": "chess", "name": "Chess", "root": "../sites/chess" }
+```
+
+Each site is served at `/<id>/`. If you give a site a `"domain"` and point that domain at the phone,
+requests for that domain are served at its root too. Up to 8 sites get their own colour.
+
+### What's real and what Android hides
+
+| Number | Where it comes from |
+| --- | --- |
+| Requests/s, response time, errors, bandwidth per site | Every request the server handles |
+| CPU per site | CPU time spent handling that site's requests |
+| Visitors | Unique IP addresses seen in the last 5 minutes |
+| Server CPU | Whole device if `/proc/stat` is readable. Android blocks that for apps, so on a phone it's the CPU used by the server program. |
+| Memory | `/proc/meminfo`, shown as "n/a" if blocked. Sites share one program, so memory isn't split per site; the site rows show total requests served instead. |
+| Network | Whole device if readable, otherwise bytes sent by the server program |
+| Temperature | Battery or CPU sensor if readable, or Termux:API. Otherwise "n/a". |
+
+The startup message says which of these your device allows.
+
+## Demo mode
+
+Open `index.html` directly in a browser. There's no build step and nothing to install.
 
 ## What's on the page
 
@@ -35,7 +94,7 @@ python3 -m http.server 8080
 Each server gets a status: **Healthy → Busy → Strained → Overloaded**, decided by CPU, memory, network,
 temperature and failed requests (`healthOf()` in `app.js`).
 
-### Things to try
+### Things to try (demo mode)
 
 - **⚡ Spike** on a site sends it 6× its normal traffic for 15 s, as if it went viral. Spike *Chess*
   and the Raspberry Pi overloads: CPU hits 100%, response times climb, red dots bounce and the log
@@ -50,45 +109,39 @@ temperature and failed requests (`healthOf()` in `app.js`).
 
 | File | Purpose |
 | --- | --- |
-| `config.js` | **Your servers and sites.** Edit this to add a server, rename a site, change specs. |
-| `simulator.js` | Fake traffic generator. Outputs one snapshot per second. |
-| `app.js` | Draws everything from those snapshots. It doesn't know the data is fake. |
+| `server/traffic_server.py` | **Live mode.** Hosts the sites, records requests, measures the device, serves the dashboard and `/api/snapshot`. Python standard library only. |
+| `server/sites.json` | The live server's name and its sites |
+| `sites/` | Three small example sites (chess, school, restaurant) |
+| `live.js` | Picks live or demo data and runs load tests |
+| `config.js` | Servers and sites for **demo mode** |
+| `simulator.js` | Fake traffic generator for demo mode. Outputs one snapshot per second. |
+| `app.js` | Draws everything from the snapshots, whichever mode they come from |
 | `styles.css` | Styles, light and dark themes. |
 
-Up to 8 sites get their own colour. Any site after the 8th is drawn in a neutral grey.
+## Snapshot format
 
-## Using real data later
-
-`app.js` only needs a **snapshot** every second in this shape (documented at the top of
-`simulator.js`):
+Both modes produce the same snapshot once a second (`GET /api/snapshot?since=<seq>` in live mode).
+Anything that sends this shape can drive the dashboard:
 
 ```js
 {
   clockMinutes: 692,               // time of day in minutes
+  seq: 1234,                       // id of the newest request in the log
   servers: [{
-    id: "pi",
-    cpu: 48.2,                     // % of the whole machine
-    cpuDemand: 48.2,               // same as cpu unless overloaded
-    systemCpu: 4,                  // OS / background use
-    ramMB: 1510, ram: 36.9,        // used MB and %
-    netMbps: 21.4, net: 21.4,      // outbound Mb/s and % of link
-    temp: 51.0,                    // °C
+    id: "phone",
+    cpu: 12.5, cpuDemand: 12.5,    // % of the whole machine
+    systemCpu: 3,                  // CPU not spent on site requests
+    ramMB: 1510, ram: 36.9,        // used MB and %, or null
+    netMbps: 2.4, net: 2.4,        // outbound Mb/s and % of link
+    temp: 31.0,                    // °C, or null
+    visitors: 3,                   // unique visitors across all sites
     errorRate: 0,                  // 0..1 share of requests failing
-    sites: [{ id: "chess", rps: 6.3, visitors: 57, netMbps: 2.3,
-              cpu: 15, ramMB: 298, latencyMs: 41, errorRate: 0 }]
+    sites: [{ id: "chess", rps: 6.3, visitors: 2, netMbps: 0.3, cpu: 1.2,
+              ramMB: null, latencyMs: 2.1, errorRate: 0, total: 812 }]
   }],
-  requests: [{ siteId, serverId, ip, method, path, status, ms, bytes, offset }]
+  requests: [{ siteId, ip, method, path, status, ms, bytes, clock, offset }]
 }
 ```
 
-Possible approaches for the real thing:
-
-1. **Per-site traffic.** Run all sites behind one reverse proxy (nginx, Caddy or Traefik) that
-   writes JSON access logs. A small script tails the log and counts requests/s, bytes and response
-   time per `Host`.
-2. **Per-server load.** On each machine, read CPU, memory, network and temperature from
-   `/proc` and `/sys/class/thermal` (or use `node_exporter`/Prometheus).
-3. **Per-site CPU and memory.** Run each site in its own Docker container and use
-   `docker stats`, or use systemd service cgroups.
-4. Expose the combined snapshot at `/api/snapshot`, or push it over a WebSocket. Then, in
-   `app.js`, replace `sim.tick(1)` with the fetched snapshot.
+To show several machines (phone + Pi + PC) on one dashboard, run the server on each one and merge
+their snapshots. That's the natural next step.

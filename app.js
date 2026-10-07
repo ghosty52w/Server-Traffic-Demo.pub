@@ -1,12 +1,13 @@
 /*
- * Dashboard renderer. Reads snapshots from the simulator once per second and
- * animates request dots in between. Nothing here knows the data is fake.
+ * Dashboard renderer. Reads a snapshot once per second — from the real server
+ * or from the simulator (see live.js) — and animates request dots in between.
  */
-(function () {
+(async function () {
   "use strict";
 
-  const config = window.TRAFFIC_CONFIG;
-  const sim = new window.TrafficSimulator(config);
+  const source = await window.pickTrafficSource();
+  const config = source.config;
+  const LIVE = source.live;
 
   const SVGNS = "http://www.w3.org/2000/svg";
   const HISTORY_LEN = 120; // points in each server's CPU chart
@@ -14,7 +15,7 @@
   const LOG_ROWS = 14;
   const LOG_PER_TICK = 5;
   const MAX_PARTICLES = 500;
-  const SPIKE = { multiplier: 6, seconds: 15 };
+  const SPIKE_LABEL = LIVE ? ["⚡ Load test", "⚡ Testing…"] : ["⚡ Spike", "⚡ Spiking…"];
 
   const STATUS = [
     { label: "Healthy", glyph: "✓", note: "" },
@@ -45,16 +46,18 @@
   const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
   const sum = (arr, f) => arr.reduce((t, x) => t + f(x), 0);
 
+  const na = (v) => v == null;
   const fmt = {
     rps: (v) => (v < 10 ? v.toFixed(1) : Math.round(v).toLocaleString()),
     int: (v) => Math.round(v).toLocaleString(),
     compact: (v) =>
-      v >= 1e6 ? (v / 1e6).toFixed(2) + "M" : v >= 1e4 ? (v / 1e3).toFixed(1) + "K" : Math.round(v).toLocaleString(),
-    mbps: (v) => (v < 1 ? Math.round(v * 1000) + " kb/s" : v < 100 ? v.toFixed(1) + " Mb/s" : Math.round(v) + " Mb/s"),
-    mb: (v) => (v >= 1024 ? (v / 1024).toFixed(1) + " GB" : Math.round(v) + " MB"),
-    ms: (v) => (v >= 1000 ? (v / 1000).toFixed(1) + " s" : Math.round(v) + " ms"),
-    pct: (v) => (v < 10 ? v.toFixed(1) : Math.round(v)) + "%",
+      na(v) ? "n/a" : v >= 1e6 ? (v / 1e6).toFixed(2) + "M" : v >= 1e4 ? (v / 1e3).toFixed(1) + "K" : Math.round(v).toLocaleString(),
+    mbps: (v) => (na(v) ? "n/a" : v < 1 ? Math.round(v * 1000) + " kb/s" : v < 100 ? v.toFixed(1) + " Mb/s" : Math.round(v) + " Mb/s"),
+    mb: (v) => (na(v) ? "n/a" : v >= 1024 ? (v / 1024).toFixed(1) + " GB" : Math.round(v) + " MB"),
+    ms: (v) => (v >= 1000 ? (v / 1000).toFixed(1) + " s" : v < 10 ? v.toFixed(1) + " ms" : Math.round(v) + " ms"),
+    pct: (v) => (na(v) ? "n/a" : v < 10 ? v.toFixed(1) : Math.round(v)) + "%",
     bytes: (b) => (b >= 1048576 ? (b / 1048576).toFixed(1) + " MB" : b >= 1024 ? Math.round(b / 1024) + " KB" : b + " B"),
+    link: (mbps) => (mbps >= 1000 ? mbps / 1000 + " Gb/s" : mbps + " Mb/s"),
     clock(minutes, withSeconds) {
       const m = ((minutes % 1440) + 1440) % 1440;
       const hh = String(Math.floor(m / 60)).padStart(2, "0");
@@ -94,6 +97,10 @@
   }
   const siteById = new Map(sites.map((x) => [x.id, x]));
 
+  // A server can report unique visitors itself (one device on three sites is one visitor).
+  const visitorsOnline = () =>
+    sum([...serverSnap.values()], (srv) => srv.visitors ?? sum(srv.sites, (x) => x.visitors));
+
   /* ---------- live state ---------- */
 
   let paused = false;
@@ -105,6 +112,7 @@
   const totalHistory = [];
   const errorWindow = [];
   let served = 0;
+  let servedBase = null; // live: server's request total when the page opened
 
   function record(snap) {
     latest = snap;
@@ -121,7 +129,13 @@
     const all = snap.servers.flatMap((x) => x.sites);
     push(totalHistory, sum(all, (x) => x.rps), SPARK_LEN);
     push(errorWindow, sum(all, (x) => x.rps * x.errorRate), 60);
-    served += sum(all, (x) => x.rps * (1 - x.errorRate));
+    if (LIVE) {
+      const total = sum(all, (x) => x.total || 0);
+      if (servedBase == null) servedBase = total;
+      served = total - servedBase;
+    } else {
+      served += sum(all, (x) => x.rps * (1 - x.errorRate));
+    }
   }
 
   function push(arr, v, max) {
@@ -193,7 +207,9 @@
         { value: fmt.rps(st.rps), label: "requests / second" },
         { value: fmt.int(st.visitors), label: "visitors online" },
         { value: fmt.pct(st.cpu), label: "of the server's CPU" },
-        { value: fmt.mb(st.ramMB), label: "memory" },
+        LIVE
+          ? { value: fmt.compact(st.total), label: "requests served in total" }
+          : { value: fmt.mb(st.ramMB), label: "memory" },
         { value: fmt.mbps(st.netMbps), label: "bandwidth" },
         { value: fmt.ms(st.latencyMs), label: "response time" },
       ];
@@ -212,9 +228,9 @@
         sub: server.hardware,
         rows: [
           { value: fmt.pct(st.cpu), label: "CPU" },
-          { value: `${fmt.mb(st.ramMB)} / ${fmt.mb(server.ramMB)}`, label: "memory" },
+          { value: na(st.ramMB) ? "n/a" : `${fmt.mb(st.ramMB)} / ${fmt.mb(server.ramMB)}`, label: "memory" },
           { value: fmt.mbps(st.netMbps), label: "network out" },
-          { value: `${Math.round(st.temp)} °C`, label: "temperature" },
+          { value: na(st.temp) ? "n/a" : `${Math.round(st.temp)} °C`, label: "temperature" },
           { value: fmt.rps(sum(st.sites, (x) => x.rps)), label: "requests / second" },
         ],
       };
@@ -233,6 +249,10 @@
       s("rect", { x: 6, y: 2.5, width: 12, height: 19, rx: 2 }),
       s("path", { d: "M9 6.5h6M9 9.5h6" }),
       s("circle", { cx: 12, cy: 16, r: 1.6 }),
+    ],
+    phone: () => [
+      s("rect", { x: 7, y: 2.5, width: 10, height: 19, rx: 2 }),
+      s("path", { d: "M10.5 18.5h3" }),
     ],
     laptop: () => [
       s("rect", { x: 5, y: 5, width: 14, height: 10, rx: 1.5 }),
@@ -302,7 +322,7 @@
 
     // Visitors
     const visValue = s("text", { class: "node-value", x: X.vis[0] + 16, y: cy + 10 });
-    const visSub = s("text", { class: "node-sub", x: X.vis[0] + 16, y: cy + 28, text: "on the internet" });
+    const visSub = s("text", { class: "node-sub", x: X.vis[0] + 16, y: cy + 28, text: LIVE ? "real visitors" : "on the internet" });
     const visitorsG = s("g", { class: "node-g", tabindex: 0 },
       rect(X.vis[0], X.vis[1], cy - 46, cy + 46),
       s("g", { class: "node-icon", transform: `translate(${X.vis[1] - 36} ${cy - 34})` },
@@ -316,9 +336,9 @@
     );
     bindTip(visitorsG, () => ({
       title: "Visitors",
-      sub: "People on the internet using your sites",
+      sub: LIVE ? "Devices that requested a page in the last 5 minutes" : "People on the internet using your sites",
       rows: [
-        { value: fmt.int(sum(sites, (x) => siteSnap.get(x.id)?.visitors || 0)), label: "online now" },
+        { value: fmt.int(visitorsOnline()), label: "online now" },
         { value: fmt.rps(totalHistory.at(-1) || 0), label: "requests / second" },
       ],
     }));
@@ -333,11 +353,13 @@
       ),
       s("text", { class: "node-title", x: X.router[0] + 16, y: cy - 14, text: "Router" }),
       routerValue,
-      s("text", { class: "node-sub", x: X.router[0] + 16, y: cy + 28, text: "sends by domain" })
+      s("text", { class: "node-sub", x: X.router[0] + 16, y: cy + 28, text: LIVE ? "home Wi-Fi" : "sends by domain" })
     );
     bindTip(routerG, () => ({
-      title: "Router · reverse proxy",
-      sub: "Looks at the domain name and forwards each request to the right server",
+      title: LIVE ? "Router" : "Router · reverse proxy",
+      sub: LIVE
+        ? "Your Wi-Fi router passes each request on to the server"
+        : "Looks at the domain name and forwards each request to the right server",
       rows: config.servers.map((srv) => ({
         value: fmt.rps(sum(serverSnap.get(srv.id)?.sites || [], (x) => x.rps)),
         label: `req/s → ${srv.name}`,
@@ -379,6 +401,10 @@
         num
       );
       bindTip(g, siteTip(site));
+      if (LIVE && site.url) {
+        g.style.cursor = "pointer";
+        g.addEventListener("click", () => window.open(site.url, "_blank", "noopener"));
+      }
       gNodes.append(g);
       siteNodes[site.id] = { g, num };
     }
@@ -395,7 +421,7 @@
   function updateFlow() {
     const total = totalHistory.at(-1) || 0;
     flow.edgeMain.style.strokeWidth = edgeWidth(total);
-    flow.visValue.textContent = `${fmt.int(sum(sites, (x) => siteSnap.get(x.id).visitors))} online`;
+    flow.visValue.textContent = `${fmt.int(visitorsOnline())} online`;
     flow.routerValue.textContent = `${fmt.rps(total)} req/s`;
 
     for (const server of config.servers) {
@@ -413,7 +439,7 @@
       flow.siteEdges[site.id].style.strokeWidth = edgeWidth(st.rps);
       const n = flow.siteNodes[site.id];
       n.num.textContent = `${fmt.rps(st.rps)} req/s`;
-      n.g.classList.toggle("spiking", sim.isSpiking(site.id));
+      n.g.classList.toggle("spiking", source.isSpiking(site.id));
     }
   }
 
@@ -534,24 +560,28 @@
         const wrap = h("div", null, h("dt", { text: label }), dd, withBar ? h("span", { class: "bar" }, bar) : null);
         return { wrap, dd, bar };
       };
-      const cpu = stat("CPU", true), ram = stat("Memory", true), net = stat("Bandwidth", true),
+      const cpu = stat("CPU", true), ram = stat(LIVE ? "Served" : "Memory", true), net = stat("Bandwidth", true),
         lat = stat("Response"), vis = stat("Visitors");
       const spark = s("svg", { class: "spark", "aria-hidden": "true" });
       const rps = h("strong", { text: "0" });
       const btn = h("button", {
         type: "button",
         class: "spike",
-        title: `Simulate ${site.name} going viral (${SPIKE.multiplier}× traffic for ${SPIKE.seconds} s)`,
-        text: "⚡ Spike",
+        title: LIVE
+          ? `Send real requests to ${site.name} from this browser for 15 s`
+          : `Simulate ${site.name} going viral (6× traffic for 15 s)`,
+        text: SPIKE_LABEL[0],
         onclick: () => {
-          sim.spike(site.id, SPIKE.multiplier, SPIKE.seconds);
+          source.spike(site.id);
           updateServers();
         },
       });
       const li = h("li", { class: "site", style: `--c:${site.color}` },
         h("span", { class: "dot" }),
         h("div", { class: "site-main" },
-          h("div", { class: "site-name", text: site.name }),
+          LIVE && site.url
+            ? h("a", { class: "site-name", href: site.url, target: "_blank", rel: "noopener", text: site.name })
+            : h("div", { class: "site-name", text: site.name }),
           h("div", { class: "site-domain", text: site.domain })
         ),
         spark,
@@ -592,18 +622,29 @@
         h("div", { class: "hw-icon" }, hwIcon(server.kind)),
         h("div", { class: "server-title" },
           h("h2", { text: `${server.name} · ${server.hardware}` }),
-          h("p", { text: `${server.cores} cores · ${fmt.mb(server.ramMB)} RAM · ${server.netMbps >= 1000 ? server.netMbps / 1000 + " Gb/s" : server.netMbps + " Mb/s"} network` })
+          h("p", { text: [
+            `${server.cores} cores`,
+            na(server.ramMB) ? null : `${fmt.mb(server.ramMB)} RAM`,
+            `${fmt.link(server.netMbps)} network`,
+          ].filter(Boolean).join(" · ") })
         ),
         pill
       ),
-      h("div", { class: "section-label" }, "Sites", h("span", { text: "requests / second · last 60 s" })),
-      list,
-      h("div", { class: "section-label" }, "How hard it's working", h("span", { text: "right now" })),
-      h("div", { class: "meters" }, meters.cpu.wrap, meters.ram.wrap, meters.net.wrap, meters.temp.wrap),
-      alert,
-      h("div", { class: "section-label" }, "CPU used by each site", h("span", { class: "chart-range", text: "" })),
-      h("div", null, chartWrap, legend)
+      h("div", { class: "server-body" },
+        h("div", { class: "server-col" },
+          h("div", { class: "section-label" }, "Sites", h("span", { text: "requests / second · last 60 s" })),
+          list
+        ),
+        h("div", { class: "server-col" },
+          h("div", { class: "section-label" }, "How hard it's working", h("span", { text: "right now" })),
+          h("div", { class: "meters" }, meters.cpu.wrap, meters.ram.wrap, meters.net.wrap, meters.temp.wrap),
+          alert,
+          h("div", { class: "section-label" }, "CPU used by each site", h("span", { class: "chart-range", text: "" })),
+          h("div", null, chartWrap, legend)
+        )
+      )
     );
+    if (config.servers.length === 1) card.classList.add("solo");
     serversEl.append(card);
 
     const ref = { card, pill, siteRows, meters, alert, alertGlyph, alertText, chartSvg, chartWrap, hover: null,
@@ -634,16 +675,22 @@
         row.rps.textContent = fmt.rps(siteSt.rps);
         row.cpu.dd.textContent = fmt.pct(siteSt.cpu);
         row.cpu.bar.style.width = clamp(siteSt.cpu, 0, 100) + "%";
-        row.ram.dd.textContent = fmt.mb(siteSt.ramMB);
-        row.ram.bar.style.width = clamp((siteSt.ramMB / server.ramMB) * 100, 0, 100) + "%";
+        if (LIVE) {
+          const serverTotal = Math.max(1, sum(st.sites, (x) => x.total || 0));
+          row.ram.dd.textContent = fmt.compact(siteSt.total || 0);
+          row.ram.bar.style.width = clamp(((siteSt.total || 0) / serverTotal) * 100, 0, 100) + "%";
+        } else {
+          row.ram.dd.textContent = fmt.mb(siteSt.ramMB);
+          row.ram.bar.style.width = clamp((siteSt.ramMB / server.ramMB) * 100, 0, 100) + "%";
+        }
         row.net.dd.textContent = fmt.mbps(siteSt.netMbps);
         row.net.bar.style.width = clamp((siteSt.netMbps / server.netMbps) * 100, 0, 100) + "%";
         row.lat.dd.textContent = fmt.ms(siteSt.latencyMs);
         row.vis.dd.textContent = fmt.int(siteSt.visitors);
-        const spiking = sim.isSpiking(site.id);
+        const spiking = source.isSpiking(site.id);
         row.li.classList.toggle("spiking", spiking);
         row.btn.disabled = spiking;
-        row.btn.textContent = spiking ? "⚡ Spiking…" : "⚡ Spike";
+        row.btn.textContent = SPIKE_LABEL[spiking ? 1 : 0];
         drawSpark(row.spark, rpsHistory.get(site.id), site.color);
       }
 
@@ -653,22 +700,39 @@
       m.cpu.value.replaceChildren(h("b", { text: fmt.pct(st.cpu) }));
       m.cpu.note.textContent = st.cpuDemand > 100
         ? `Needs ${Math.round(st.cpuDemand)}% — more than it has`
-        : `${server.cores} cores`;
+        : server.cpuScope === "process"
+          ? `Used by the server program · ${server.cores} cores`
+          : `${server.cores} cores`;
 
       setLevel(m.ram.wrap, health.ram);
-      m.ram.fill.style.width = st.ram + "%";
-      m.ram.value.replaceChildren(h("b", { text: fmt.mb(st.ramMB) }), ` of ${fmt.mb(server.ramMB)}`);
-      m.ram.note.textContent = `${fmt.pct(st.ram)} used`;
+      if (na(st.ramMB)) {
+        m.ram.fill.style.width = "0%";
+        m.ram.value.replaceChildren(h("b", { text: "n/a" }));
+        m.ram.note.textContent = "This device doesn't share it";
+      } else {
+        m.ram.fill.style.width = st.ram + "%";
+        m.ram.value.replaceChildren(h("b", { text: fmt.mb(st.ramMB) }), ` of ${fmt.mb(server.ramMB)}`);
+        m.ram.note.textContent = `${fmt.pct(st.ram)} used`;
+      }
 
       setLevel(m.net.wrap, health.net);
       m.net.fill.style.width = Math.max(st.net, 0.5) + "%";
       m.net.value.replaceChildren(h("b", { text: fmt.mbps(st.netMbps) }));
-      m.net.note.textContent = `${fmt.pct(st.net)} of ${server.netMbps >= 1000 ? server.netMbps / 1000 + " Gb/s" : server.netMbps + " Mb/s"}`;
+      m.net.note.textContent = `${fmt.pct(st.net)} of ${fmt.link(server.netMbps)}` +
+        (server.netScope === "process" ? " · sent by the server program" : "");
 
       setLevel(m.temp.wrap, health.temp);
-      m.temp.fill.style.width = clamp(((st.temp - 20) / (server.tempCrit - 20)) * 100, 0, 100) + "%";
-      m.temp.value.replaceChildren(h("b", { text: `${Math.round(st.temp)} °C` }));
-      m.temp.note.textContent = server.kind === "pi" ? `Slows itself down at ${server.tempCrit} °C` : `Limit ${server.tempCrit} °C`;
+      if (na(st.temp)) {
+        m.temp.fill.style.width = "0%";
+        m.temp.value.replaceChildren(h("b", { text: "n/a" }));
+        m.temp.note.textContent = "No sensor this program can read";
+      } else {
+        m.temp.fill.style.width = clamp(((st.temp - 20) / (server.tempCrit - 20)) * 100, 0, 100) + "%";
+        m.temp.value.replaceChildren(h("b", { text: `${Math.round(st.temp)} °C` }));
+        m.temp.note.textContent = server.tempKind === "battery"
+          ? `Battery · gets hot above ${server.tempCrit} °C`
+          : server.kind === "pi" ? `Slows itself down at ${server.tempCrit} °C` : `Limit ${server.tempCrit} °C`;
+      }
 
       if (health.overall >= 2) {
         ref.alert.hidden = false;
@@ -748,8 +812,10 @@
       base = top;
     }
 
-    // x-axis: simulated clock at the oldest point and now
-    kids.push(s("text", { class: "tick", x: g.x(0, n), y: CH.h - 4, text: fmt.clock(data[0].clock) }));
+    // x-axis: clock at the oldest point and now
+    if (g.x(0, n) < g.w - CH.r - 90) {
+      kids.push(s("text", { class: "tick", x: g.x(0, n), y: CH.h - 4, text: fmt.clock(data[0].clock, LIVE) }));
+    }
     kids.push(s("text", { class: "tick", x: g.w - CH.r, y: CH.h - 4, "text-anchor": "end", text: "now" }));
 
     if (ref.hover != null && ref.hover < n) {
@@ -757,7 +823,7 @@
       kids.push(s("line", { class: "crosshair", x1: x, x2: x, y1: CH.t, y2: CH.t + g.ih }));
     }
     svg.replaceChildren(...kids);
-    ref.range.textContent = `${fmt.clock(data[0].clock)} – ${fmt.clock(data[n - 1].clock)} (simulated)`;
+    ref.range.textContent = `${fmt.clock(data[0].clock, LIVE)} – ${fmt.clock(data[n - 1].clock, LIVE)}${LIVE ? "" : " (simulated)"}`;
   }
 
   function bindHistory(server, ref) {
@@ -783,7 +849,7 @@
       rows.push({ color: "var(--system)", value: fmt.pct(p.sys), label: "System" });
       return {
         title: `${fmt.pct(total)} CPU`,
-        sub: `${fmt.clock(p.clock)} (simulated)${p.demand > 100 ? " · overloaded" : ""}`,
+        sub: `${fmt.clock(p.clock, LIVE)}${LIVE ? "" : " (simulated)"}${p.demand > 100 ? " · overloaded" : ""}`,
         rows,
       };
     };
@@ -811,7 +877,7 @@
     const all = [...siteSnap.values()];
     const total = totalHistory.at(-1) || 0;
     $("kpiRps").textContent = fmt.rps(total);
-    $("kpiVisitors").textContent = fmt.int(sum(all, (x) => x.visitors));
+    $("kpiVisitors").textContent = fmt.int(visitorsOnline());
     $("kpiNet").textContent = fmt.mbps(sum([...serverSnap.values()], (x) => x.netMbps));
     $("kpiServed").textContent = fmt.compact(served);
 
@@ -860,7 +926,10 @@
   }
   showLogPlaceholder();
 
-  const STATUS_TEXT = { 200: "OK", 201: "Created", 304: "Cached", 404: "Not found", 503: "Too busy" };
+  const STATUS_TEXT = {
+    200: "OK", 201: "Created", 301: "Redirect", 304: "Cached", 404: "Not found",
+    405: "Not allowed", 500: "Error", 503: "Too busy",
+  };
 
   function queueLog(snap) {
     const f = logFilter.value;
@@ -871,10 +940,10 @@
     }
     list = list.slice(0, LOG_PER_TICK);
     const now = performance.now();
-    const tickStart = snap.clockMinutes - sim.minutesPerSecond;
+    const tickStart = snap.clockMinutes - source.minutesPerSecond;
     for (const r of list) {
       r.due = now + r.offset * 1000;
-      r.clock = tickStart + r.offset * sim.minutesPerSecond;
+      if (r.clock == null) r.clock = tickStart + r.offset * source.minutesPerSecond;
       logQueue.push(r);
     }
     logQueue.sort((a, b) => a.due - b.due);
@@ -886,7 +955,7 @@
 
   function addLogRow(r) {
     const site = siteById.get(r.siteId);
-    const lvl = r.status >= 500 ? 3 : r.status === 404 ? 1 : null;
+    const lvl = r.status >= 500 ? 3 : r.status >= 400 ? 1 : null;
     const statusCell = h("span", { class: "status-cell" },
       lvl != null ? h("span", { class: "status-glyph", "data-level": lvl, text: lvl === 3 ? "✕" : "!" }) : null,
       `${r.status} ${STATUS_TEXT[r.status] || ""}`
@@ -916,13 +985,13 @@
   });
 
   $("rush").addEventListener("click", () => {
-    sim.rush(2.6, 20);
+    source.rush();
     if (latest) updateFlow();
   });
 
   for (const btn of document.querySelectorAll(".seg button")) {
     btn.addEventListener("click", () => {
-      sim.minutesPerSecond = Number(btn.dataset.speed);
+      source.minutesPerSecond = Number(btn.dataset.speed);
       for (const b of document.querySelectorAll(".seg button")) b.setAttribute("aria-pressed", String(b === btn));
     });
   }
@@ -952,20 +1021,54 @@
     renderTip();
   }
 
-  function tick() {
-    const snap = sim.tick(1);
-    record(snap);
-    queueLog(snap);
-    render();
+  let inFlight = false;
+  let failures = 0;
+  async function tick() {
+    if (inFlight) return;
+    inFlight = true;
+    try {
+      const snap = await source.next();
+      record(snap);
+      queueLog(snap);
+      render();
+      if (failures) setConnection(true);
+      failures = 0;
+    } catch (err) {
+      failures += 1;
+      if (failures >= 2) setConnection(false);
+    } finally {
+      inFlight = false;
+    }
   }
 
-  // Warm up so the charts open with two minutes of history ending at the start time.
-  const startMinutes = sim.clockMinutes;
-  sim.clockMinutes = (startMinutes - HISTORY_LEN * sim.minutesPerSecond + 1440) % 1440;
-  for (let i = 0; i < HISTORY_LEN; i++) record(sim.tick(1));
-  served = 0;
-  errorWindow.length = 0;
-  render();
+  function setConnection(ok) {
+    $("modeLabel").textContent = ok ? "Live · real visitors" : "Live · can't reach the server, retrying…";
+    document.body.classList.toggle("offline", !ok);
+  }
+
+  if (LIVE) {
+    // Real data: no pretend controls, and the page explains where numbers come from.
+    $("modeLabel").textContent = "Live · real visitors";
+    document.body.classList.add("live");
+    $("rush").textContent = "Load test all";
+    $("rush").title = "Send real requests to every site from this browser for 15 seconds";
+    $("kpiVisitorsSub").textContent = "devices seen in the last 5 min";
+    $("flowHelp").textContent =
+      "Each dot is a real request: a device on your network (or the internet) asking for a page. " +
+      "Click a site to open it — your visit shows up here. Red dots are requests that failed.";
+    $("footNote").textContent =
+      `Live data from ${location.host}. Add or change sites in server/sites.json.`;
+    await tick();
+  } else {
+    // Warm up so the charts open with two minutes of history ending at the start time.
+    const sim = source.sim;
+    const startMinutes = sim.clockMinutes;
+    sim.clockMinutes = (startMinutes - HISTORY_LEN * sim.minutesPerSecond + 1440) % 1440;
+    for (let i = 0; i < HISTORY_LEN; i++) record(sim.tick(1));
+    served = 0;
+    errorWindow.length = 0;
+    render();
+  }
 
   setInterval(() => {
     if (!paused) tick();
