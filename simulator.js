@@ -80,7 +80,10 @@
       }
     }
 
-    /** Multiply one site's traffic for a while — e.g. it got shared on social media. */
+    /**
+     * Load test: multiply one site's traffic for a while. Its server also burns
+     * CPU until it is at 100%, like the real load test does.
+     */
     spike(siteId, multiplier = 5, seconds = 15) {
       const s = this.sites.get(siteId);
       if (!s) return;
@@ -88,9 +91,14 @@
       s.boostUntil = this.elapsed + seconds;
     }
 
-    /** Every site gets busier at once. */
-    rush(multiplier = 2.6, seconds = 20) {
+    /** Load test every site, so every server is pushed to its limit. */
+    rush(multiplier = 2.6, seconds = 15) {
       for (const id of this.sites.keys()) this.spike(id, multiplier, seconds);
+    }
+
+    /** End the load test on one site, or on all of them. */
+    stop(siteId) {
+      for (const [id, s] of this.sites) if (!siteId || id === siteId) s.boostUntil = 0;
     }
 
     isSpiking(siteId) {
@@ -121,8 +129,16 @@
           return { site, rps: s.rps, cpu };
         });
 
-        // 2. Can the server keep up?
-        const cpuDemand = server.idleCpu + demand.reduce((sum, d) => sum + d.cpu, 0);
+        // 2. A load test burns CPU on top of its traffic until the server is maxed out.
+        let cpuDemand = server.idleCpu + demand.reduce((sum, d) => sum + d.cpu, 0);
+        const testing = demand.filter((d) => this.elapsed < this.sites.get(d.site.id).boostUntil);
+        if (testing.length && cpuDemand < 100) {
+          const extra = (100 - cpuDemand) / testing.length;
+          for (const d of testing) d.cpu += extra;
+          cpuDemand = 100;
+        }
+
+        // 3. Can the server keep up?
         const overloaded = cpuDemand > 100;
         const served = overloaded ? 100 / cpuDemand : 1;
         const errorRate = overloaded ? 1 - served : 0;

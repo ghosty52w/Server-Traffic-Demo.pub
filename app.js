@@ -6,7 +6,7 @@
   "use strict";
 
   const source = await window.pickTrafficSource();
-  const config = source.config;
+  let config = source.config; // live mode replaces it when sites are added or removed
   const LIVE = source.live;
 
   const SVGNS = "http://www.w3.org/2000/svg";
@@ -15,13 +15,13 @@
   const LOG_ROWS = 14;
   const LOG_PER_TICK = 5;
   const MAX_PARTICLES = 500;
-  const SPIKE_LABEL = LIVE ? ["⚡ Load test", "⚡ Testing…"] : ["⚡ Spike", "⚡ Spiking…"];
+  const SPIKE_LABEL = ["⚡ Load test", "■ Stop"];
 
   const STATUS = [
     { label: "Healthy", glyph: "✓", note: "" },
     { label: "Busy", glyph: "!", note: "" },
     { label: "Strained", glyph: "!", note: "Close to its limit — pages are getting slower." },
-    { label: "Overloaded", glyph: "✕", note: "" },
+    { label: "Overloaded", glyph: "✕", note: "CPU is maxed out — pages are slow to load." },
   ];
 
   /* ---------- small helpers ---------- */
@@ -86,16 +86,33 @@
 
   /* ---------- static data ---------- */
 
-  const sites = [];
-  for (const server of config.servers) {
-    for (const site of server.sites) {
-      site.serverId = server.id;
-      // Eight distinct colours; any extra sites share a neutral one rather than repeating a hue.
-      site.color = sites.length < 8 ? `var(--s${sites.length + 1})` : "var(--s-other)";
-      sites.push(site);
+  let sites = [];
+  let siteById = new Map();
+  // Each site keeps its colour while it exists, so adding a site never repaints the others.
+  const colorSlots = new Map();
+
+  function indexSites() {
+    const ids = new Set(config.servers.flatMap((srv) => srv.sites.map((x) => x.id)));
+    for (const id of colorSlots.keys()) if (!ids.has(id)) colorSlots.delete(id);
+    sites = [];
+    for (const server of config.servers) {
+      for (const site of server.sites) {
+        site.serverId = server.id;
+        if (!colorSlots.has(site.id)) {
+          const used = new Set(colorSlots.values());
+          let slot = 1;
+          while (used.has(slot)) slot++;
+          colorSlots.set(site.id, slot);
+        }
+        // Eight distinct colours; any extra sites share a neutral one rather than repeating a hue.
+        const slot = colorSlots.get(site.id);
+        site.color = slot <= 8 ? `var(--s${slot})` : "var(--s-other)";
+        sites.push(site);
+      }
     }
+    siteById = new Map(sites.map((x) => [x.id, x]));
   }
-  const siteById = new Map(sites.map((x) => [x.id, x]));
+  indexSites();
 
   // A server can report unique visitors itself (one device on three sites is one visitor).
   const visitorsOnline = () =>
@@ -107,8 +124,9 @@
   let latest = null;
   const siteSnap = new Map();
   const serverSnap = new Map();
-  const cpuHistory = new Map(config.servers.map((x) => [x.id, []]));
-  const rpsHistory = new Map(sites.map((x) => [x.id, []]));
+  const cpuHistory = new Map();
+  const rpsHistory = new Map();
+  const series = (map, key) => map.get(key) || map.set(key, []).get(key);
   const totalHistory = [];
   const errorWindow = [];
   let served = 0;
@@ -122,9 +140,9 @@
       for (const st of srv.sites) {
         siteSnap.set(st.id, st);
         point.sites[st.id] = st.cpu;
-        push(rpsHistory.get(st.id), st.rps, SPARK_LEN);
+        push(series(rpsHistory, st.id), st.rps, SPARK_LEN);
       }
-      push(cpuHistory.get(srv.id), point, HISTORY_LEN);
+      push(series(cpuHistory, srv.id), point, HISTORY_LEN);
     }
     const all = snap.servers.flatMap((x) => x.sites);
     push(totalHistory, sum(all, (x) => x.rps), SPARK_LEN);
@@ -263,7 +281,7 @@
 
   /* ---------- flow diagram ---------- */
 
-  const flow = buildFlow($("flow"));
+  let flow = buildFlow($("flow"));
 
   function buildFlow(svg) {
     const ROW = 46, GAP = 24, PAD = 22;
@@ -436,6 +454,7 @@
     }
     for (const site of sites) {
       const st = siteSnap.get(site.id);
+      if (!st) continue;
       flow.siteEdges[site.id].style.strokeWidth = edgeWidth(st.rps);
       const n = flow.siteNodes[site.id];
       n.num.textContent = `${fmt.rps(st.rps)} req/s`;
@@ -447,7 +466,7 @@
 
   const particles = [];
   const pool = [];
-  const spawnDebt = new Map(sites.map((x) => [x.id, 0]));
+  const spawnDebt = new Map();
   let dotScale = 1;
   const SCALES = [1, 2, 5, 10, 20, 50, 100];
 
@@ -487,7 +506,8 @@
     if (!latest) return;
     for (const site of sites) {
       const st = siteSnap.get(site.id);
-      let debt = spawnDebt.get(site.id) + (st.rps * dt / dotScale) * (0.4 + Math.random() * 1.2);
+      if (!st) continue;
+      let debt = (spawnDebt.get(site.id) || 0) + (st.rps * dt / dotScale) * (0.4 + Math.random() * 1.2);
       debt = Math.min(debt, 4);
       while (debt >= 1 && particles.length < MAX_PARTICLES) {
         debt -= 1;
@@ -498,7 +518,7 @@
 
     for (let i = particles.length - 1; i >= 0; i--) {
       const p = particles[i];
-      const st = siteSnap.get(p.site.id);
+      const st = siteSnap.get(p.site.id) || p.site;
       // Last leg slows down when the server is slow to answer.
       const dur = p.seg === 0 ? 0.5 : p.seg === 1 ? 0.55 : p.seg === 2 ? 0.5 * clamp(st.latencyMs / p.site.latencyMs, 1, 6) : 0.7;
       p.t += dt / dur;
@@ -543,7 +563,12 @@
   const serverCards = new Map();
   const serversEl = $("servers");
 
-  for (const server of config.servers) serverCards.set(server.id, buildServerCard(server));
+  function buildCards() {
+    serversEl.replaceChildren();
+    serverCards.clear();
+    for (const server of config.servers) serverCards.set(server.id, buildServerCard(server));
+  }
+  buildCards();
 
   function buildServerCard(server) {
     const pill = h("span", { class: "status-pill" },
@@ -568,12 +593,14 @@
         type: "button",
         class: "spike",
         title: LIVE
-          ? `Send real requests to ${site.name} from this browser for 15 s`
-          : `Simulate ${site.name} going viral (6× traffic for 15 s)`,
+          ? `Max out every CPU core on ${server.name} and send real requests to ${site.name} for 15 s`
+          : `Max out ${server.name}'s CPU and send ${site.name} 6× its traffic for 15 s`,
         text: SPIKE_LABEL[0],
         onclick: () => {
-          source.spike(site.id);
+          if (source.isSpiking(site.id)) source.stop();
+          else source.spike(site.id);
           updateServers();
+          updateRushButton();
         },
       });
       const li = h("li", { class: "site", style: `--c:${site.color}` },
@@ -591,6 +618,9 @@
       );
       list.append(li);
       siteRows.set(site.id, { li, spark, rps, btn, cpu, ram, net, lat, vis });
+    }
+    if (!server.sites.length) {
+      list.append(h("li", { class: "site-empty", text: "No sites yet. Put a folder in sites/ and it appears here." }));
     }
 
     const meter = (label) => {
@@ -672,6 +702,7 @@
       for (const siteSt of st.sites) {
         const site = siteById.get(siteSt.id);
         const row = ref.siteRows.get(siteSt.id);
+        if (!site || !row) continue; // site list is about to refresh
         row.rps.textContent = fmt.rps(siteSt.rps);
         row.cpu.dd.textContent = fmt.pct(siteSt.cpu);
         row.cpu.bar.style.width = clamp(siteSt.cpu, 0, 100) + "%";
@@ -689,9 +720,8 @@
         row.vis.dd.textContent = fmt.int(siteSt.visitors);
         const spiking = source.isSpiking(site.id);
         row.li.classList.toggle("spiking", spiking);
-        row.btn.disabled = spiking;
         row.btn.textContent = SPIKE_LABEL[spiking ? 1 : 0];
-        drawSpark(row.spark, rpsHistory.get(site.id), site.color);
+        drawSpark(row.spark, series(rpsHistory, site.id), site.color);
       }
 
       const m = ref.meters;
@@ -734,14 +764,25 @@
           : server.kind === "pi" ? `Slows itself down at ${server.tempCrit} °C` : `Limit ${server.tempCrit} °C`;
       }
 
-      if (health.overall >= 2) {
+      const testing = server.sites.some((x) => source.isSpiking(x.id));
+      const test = st.loadTest;
+      if (testing || (test && test.note)) {
+        const lvl = Math.max(health.overall, testing ? 2 : 1);
+        ref.alert.hidden = false;
+        setLevel(ref.alertGlyph, lvl);
+        ref.alertGlyph.textContent = STATUS[lvl].glyph;
+        ref.alertText.textContent = testing
+          ? `Load test running — pushing all ${server.cores} CPU cores to the limit` +
+            (test && test.remaining ? ` (${Math.ceil(test.remaining)} s left).` : ".")
+          : test.note;
+      } else if (health.overall >= 2) {
         ref.alert.hidden = false;
         setLevel(ref.alertGlyph, health.overall);
         ref.alertGlyph.textContent = STATUS[health.overall].glyph;
         let text = STATUS[health.overall].note;
         if (st.errorRate > 0.01) {
           const top = st.sites.reduce((a, b) => (b.cpu > a.cpu ? b : a));
-          text = `Can't keep up — ${fmt.pct(st.errorRate * 100)} of visitors get an error page. ${siteById.get(top.id).name} is using the most CPU.`;
+          text = `Can't keep up — ${fmt.pct(st.errorRate * 100)} of visitors get an error page. ${siteById.get(top.id)?.name || top.id} is using the most CPU.`;
         } else if (health.temp >= 2) {
           text = "Running hot — it may slow itself down to cool off.";
         } else if (health.ram >= 2) {
@@ -788,7 +829,7 @@
   }
 
   function drawHistory(server, ref) {
-    const data = cpuHistory.get(server.id);
+    const data = series(cpuHistory, server.id);
     const n = data.length;
     if (!n) return;
     const g = chartGeom(ref);
@@ -804,7 +845,7 @@
     const layers = [{ key: null, color: "var(--system)" }, ...server.sites.map((x) => ({ key: x.id, color: x.color }))];
     let base = new Array(n).fill(0);
     for (const layer of layers) {
-      const top = data.map((p, i) => base[i] + (layer.key ? p.sites[layer.key] : p.sys));
+      const top = data.map((p, i) => base[i] + ((layer.key ? p.sites[layer.key] : p.sys) || 0));
       let d = "M";
       for (let i = 0; i < n; i++) d += `${g.x(i, n).toFixed(1)},${g.y(top[i]).toFixed(1)}L`;
       for (let i = n - 1; i >= 0; i--) d += `${g.x(i, n).toFixed(1)},${g.y(base[i]).toFixed(1)}${i ? "L" : "Z"}`;
@@ -829,7 +870,7 @@
   function bindHistory(server, ref) {
     const svg = ref.chartSvg;
     const indexAt = (clientX) => {
-      const data = cpuHistory.get(server.id);
+      const data = series(cpuHistory, server.id);
       const n = data.length;
       const g = chartGeom(ref);
       const rect = svg.getBoundingClientRect();
@@ -838,14 +879,14 @@
       return clamp(i, 0, n - 1);
     };
     const tipFn = () => {
-      const data = cpuHistory.get(server.id);
+      const data = series(cpuHistory, server.id);
       const p = data[ref.hover];
       if (!p) return null;
-      const total = p.sys + sum(server.sites, (x) => p.sites[x.id]);
+      const total = p.sys + sum(server.sites, (x) => p.sites[x.id] || 0);
       const rows = server.sites
         .slice()
         .reverse()
-        .map((site) => ({ color: site.color, value: fmt.pct(p.sites[site.id]), label: site.name }));
+        .map((site) => ({ color: site.color, value: fmt.pct(p.sites[site.id] || 0), label: site.name }));
       rows.push({ color: "var(--system)", value: fmt.pct(p.sys), label: "System" });
       return {
         title: `${fmt.pct(total)} CPU`,
@@ -886,9 +927,11 @@
     $("kpiErrors").parentElement.setAttribute("data-level", failed >= 1 ? 3 : 0);
     $("kpiErrorsSub").textContent = failed >= 1 ? "last 60 s · a server is overloaded" : "last 60 s · all good";
 
-    const busiest = all.reduce((a, b) => (b.rps > a.rps ? b : a));
-    $("kpiBusiest").textContent = siteById.get(busiest.id).name;
-    $("kpiBusiestSub").textContent = `${Math.round((busiest.rps / Math.max(total, 0.001)) * 100)}% of all requests`;
+    const busiest = all.filter((x) => siteById.has(x.id)).reduce((a, b) => (!a || b.rps > a.rps ? b : a), null);
+    $("kpiBusiest").textContent = busiest ? siteById.get(busiest.id).name : "–";
+    $("kpiBusiestSub").textContent = busiest
+      ? `${Math.round((busiest.rps / Math.max(total, 0.001)) * 100)}% of all requests`
+      : "no sites yet";
 
     drawKpiSpark();
   }
@@ -915,7 +958,13 @@
   const logBody = $("logBody");
   const logFilter = $("logFilter");
   const logQueue = [];
-  for (const site of sites) logFilter.append(h("option", { value: site.id, text: site.name }));
+  function fillLogFilter() {
+    const current = logFilter.value;
+    while (logFilter.options.length > 2) logFilter.remove(2);
+    for (const site of sites) logFilter.append(h("option", { value: site.id, text: site.name }));
+    logFilter.value = [...logFilter.options].some((o) => o.value === current) ? current : "all";
+  }
+  fillLogFilter();
   logFilter.addEventListener("change", () => {
     logQueue.length = 0;
     showLogPlaceholder();
@@ -955,6 +1004,7 @@
 
   function addLogRow(r) {
     const site = siteById.get(r.siteId);
+    if (!site) return; // its folder was removed
     const lvl = r.status >= 500 ? 3 : r.status >= 400 ? 1 : null;
     const statusCell = h("span", { class: "status-cell" },
       lvl != null ? h("span", { class: "status-glyph", "data-level": lvl, text: lvl === 3 ? "✕" : "!" }) : null,
@@ -984,9 +1034,18 @@
     if (paused) logQueue.length = 0;
   });
 
+  const anyTesting = () => sites.some((x) => source.isSpiking(x.id));
+  function updateRushButton() {
+    $("rush").textContent = anyTesting() ? "■ Stop load test" : "Load test all";
+  }
   $("rush").addEventListener("click", () => {
-    source.rush();
-    if (latest) updateFlow();
+    if (anyTesting()) source.stop();
+    else source.rush();
+    updateRushButton();
+    if (latest) {
+      updateFlow();
+      updateServers();
+    }
   });
 
   for (const btn of document.querySelectorAll(".seg button")) {
@@ -1018,7 +1077,20 @@
     updateKpis();
     updateFlow();
     updateServers();
+    updateRushButton();
     renderTip();
+  }
+
+  // Live mode: a folder was added to or removed from sites/ — rebuild without reloading.
+  function applyConfig(next) {
+    config = next;
+    indexSites();
+    hideTip();
+    clearParticles();
+    flow = buildFlow($("flow"));
+    buildCards();
+    fillLogFilter();
+    for (const id of [...siteSnap.keys()]) if (!siteById.has(id)) siteSnap.delete(id);
   }
 
   let inFlight = false;
@@ -1028,6 +1100,7 @@
     inFlight = true;
     try {
       const snap = await source.next();
+      if (snap.configChanged) applyConfig(source.config);
       record(snap);
       queueLog(snap);
       render();
@@ -1050,14 +1123,13 @@
     // Real data: no pretend controls, and the page explains where numbers come from.
     $("modeLabel").textContent = "Live · real visitors";
     document.body.classList.add("live");
-    $("rush").textContent = "Load test all";
-    $("rush").title = "Send real requests to every site from this browser for 15 seconds";
+    $("rush").title = "Max out every CPU core on every server and send real requests to every site for 15 s";
     $("kpiVisitorsSub").textContent = "devices seen in the last 5 min";
     $("flowHelp").textContent =
       "Each dot is a real request: a device on your network (or the internet) asking for a page. " +
       "Click a site to open it — your visit shows up here. Red dots are requests that failed.";
     $("footNote").textContent =
-      `Live data from ${location.host}. Add or change sites in server/sites.json.`;
+      `Live data from ${location.host}. Every folder in sites/ on the server is a site.`;
     await tick();
   } else {
     // Warm up so the charts open with two minutes of history ending at the start time.

@@ -2,8 +2,10 @@
 """
 Real traffic server for the dashboard.
 
-Hosts the sites listed in server/sites.json, records every request they get,
-measures the machine it runs on, and serves the dashboard with live numbers.
+Hosts every folder in sites/ as a site (named after the folder), records every
+request, measures the machine it runs on, and serves the dashboard with live
+numbers. The dashboard itself is listed too, as the site "traffic". Add or remove
+a folder and it shows up on (or leaves) the dashboard within a second.
 
     python3 server/traffic_server.py            # port 8080
     python3 server/traffic_server.py --port 9000
@@ -19,13 +21,15 @@ import json
 import mimetypes
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import threading
 import time
+import warnings
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -40,9 +44,15 @@ DASHBOARD_FILES = {
     "/simulator.js": "simulator.js",
 }
 
+TRAFFIC_SITE = "traffic"  # the dashboard's own traffic is shown as this site
+RESERVED_NAMES = {TRAFFIC_SITE, "api"}
 RATE_WINDOW = 3.0  # seconds of requests averaged into "per second" numbers
 VISITOR_WINDOW = 300.0  # an IP counts as "online" for 5 minutes after its last request
 LOG_SIZE = 400
+LOAD_TEST_MAX_SECONDS = 60
+
+# Forking from the threaded server is fine here: children only run a CPU loop and exit.
+warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*fork.*")
 
 
 # ---------------------------------------------------------------- measuring the device
@@ -144,6 +154,134 @@ class TempReader:
         return self._last
 
 
+# ---------------------------------------------------------------- load test
+
+def burn_cpu(deadline, parent_pid):
+    """Keep one CPU core 100% busy until the deadline, or until the server exits."""
+    x = 1
+    while time.time() < deadline:
+        for _ in range(100_000):
+            x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+        if os.getppid() != parent_pid:
+            break
+
+
+def read_pid_cpu_seconds(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / CLK_TCK  # utime + stime
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+
+class LoadTest:
+    """
+    Pushes this machine to its CPU limit: one busy worker process per core.
+    Python's GIL means request handling alone can only fill about one core, so
+    real HTTP load from browsers runs alongside this to show its effect on the sites.
+    """
+
+    def __init__(self, cores):
+        self.cores = cores
+        self.lock = threading.Lock()
+        self.workers = []
+        self.sites = []
+        self.until = 0.0
+        self.note = None
+        self.note_at = 0.0
+        self.prev_cpu = {}
+        self.generation = 0
+
+    def active(self):
+        return bool(self.workers) and time.time() < self.until
+
+    def start(self, site_ids, seconds):
+        seconds = max(1.0, min(float(LOAD_TEST_MAX_SECONDS), seconds))
+        with self.lock:
+            self.sites = sorted(set(self.sites if self.workers else []) | set(site_ids))
+            self.note = None
+            if self.workers:
+                return  # already running: just count these sites in
+            self.until = time.time() + seconds
+            self.workers = [self._spawn(self.until) for _ in range(self.cores)]
+            self.generation += 1
+            gen, workers = self.generation, list(self.workers)
+        threading.Thread(target=self._reap, args=(gen, workers), daemon=True).start()
+
+    def stop(self, note=None):
+        with self.lock:
+            workers = list(self.workers)
+            self.until = 0.0
+            if note:
+                self.note, self.note_at = note, time.time()
+        for w in workers:
+            try:
+                if isinstance(w, int):
+                    os.kill(w, signal.SIGTERM)
+                else:
+                    w.terminate()
+            except (OSError, AttributeError):
+                pass
+
+    def _spawn(self, deadline):
+        parent = os.getpid()
+        if hasattr(os, "fork"):
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    burn_cpu(deadline, parent)
+                finally:
+                    os._exit(0)
+            return pid
+        import multiprocessing  # Windows has no fork
+        p = multiprocessing.Process(target=burn_cpu, args=(deadline, parent), daemon=True)
+        p.start()
+        return p
+
+    def _reap(self, gen, workers):
+        for w in workers:
+            try:
+                if isinstance(w, int):
+                    os.waitpid(w, 0)
+                else:
+                    w.join()
+            except OSError:
+                pass
+        with self.lock:
+            if self.generation == gen:
+                self.workers, self.sites, self.prev_cpu = [], [], {}
+
+    def cpu_seconds_since_last(self, dt):
+        """CPU time the workers used since the previous call."""
+        with self.lock:
+            workers = list(self.workers)
+        total = 0.0
+        for w in workers:
+            pid = w if isinstance(w, int) else w.pid
+            t = read_pid_cpu_seconds(pid)
+            if t is None:  # no /proc (e.g. macOS, Windows): assume a full core while running
+                total += dt if time.time() < self.until else 0
+                continue
+            total += max(0.0, t - self.prev_cpu.get(pid, 0.0))
+            self.prev_cpu[pid] = t
+        return total
+
+    def status(self):
+        now = time.time()
+        with self.lock:
+            running = bool(self.workers) and now < self.until
+            return {
+                "sites": list(self.sites) if running else [],
+                "remaining": max(0.0, self.until - now) if running else 0,
+                "workers": len(self.workers) if running else 0,
+                "note": self.note if self.note and now - self.note_at < 60 else None,
+            }
+
+
 # ---------------------------------------------------------------- recording requests
 
 class SiteStats:
@@ -155,9 +293,9 @@ class SiteStats:
 
 
 class Metrics:
-    def __init__(self, sites):
+    def __init__(self):
         self.lock = threading.Lock()
-        self.stats = {s["id"]: SiteStats() for s in sites}
+        self.stats = {}  # site id -> SiteStats, created on first use
         self.log = deque(maxlen=LOG_SIZE)
         self.seq = 0
         self.bytes_sent = 0
@@ -165,7 +303,7 @@ class Metrics:
     def record(self, site_id, ip, method, path, status, ms, nbytes, cpu):
         now = time.time()
         with self.lock:
-            st = self.stats[site_id]
+            st = self.stats.get(site_id) or self.stats.setdefault(site_id, SiteStats())
             st.events.append((now, nbytes, ms, status, cpu))
             st.total += 1
             st.visitors[ip] = now
@@ -177,11 +315,14 @@ class Metrics:
                 "path": path, "status": status, "ms": round(ms, 1), "bytes": nbytes,
             })
 
-    def sites_now(self, cores):
+    def sites_now(self, cores, site_ids):
         now = time.time()
         out = []
         with self.lock:
-            for site_id, st in self.stats.items():
+            for gone in set(self.stats) - set(site_ids):  # folder was removed
+                del self.stats[gone]
+            for site_id in site_ids:
+                st = self.stats.get(site_id) or self.stats.setdefault(site_id, SiteStats())
                 while st.events and st.events[0][0] < now - RATE_WINDOW:
                     st.events.popleft()
                 for ip, seen in list(st.visitors.items()):
@@ -227,14 +368,71 @@ class Metrics:
         return out
 
 
+# ---------------------------------------------------------------- sites folder
+
+class SiteRegistry:
+    """Every folder inside the sites directory is a site named after the folder."""
+
+    def __init__(self, sites_dir):
+        self.dir = os.path.realpath(sites_dir)
+        os.makedirs(self.dir, exist_ok=True)
+        self.lock = threading.Lock()
+        self.version = None
+        self._sites = []
+        self._scanned = 0.0
+        self.announce = None  # called with (added, removed) names
+
+    def sites(self):
+        """Current sites; the folder is re-read at most once a second."""
+        with self.lock:
+            if time.monotonic() - self._scanned >= 1.0:
+                self._scan()
+                self._scanned = time.monotonic()
+            return self._sites
+
+    def get(self, name):
+        return next((s for s in self.sites() if s["id"] == name), None)
+
+    def _scan(self):
+        try:
+            names = sorted(
+                (e.name for e in os.scandir(self.dir)
+                 if e.is_dir() and not e.name.startswith((".", "_"))
+                 and e.name not in RESERVED_NAMES and "," not in e.name),
+                key=str.lower,
+            )
+        except OSError:
+            names = []
+        version = "/".join(names)
+        if version == self.version:
+            return
+        old = {s["id"] for s in self._sites}
+        self._sites = [{"id": n, "name": n, "root": self._web_root(os.path.join(self.dir, n))} for n in names]
+        if self.version is not None and self.announce:
+            self.announce(sorted(set(names) - old), sorted(old - set(names)))
+        self.version = version
+
+    @staticmethod
+    def _web_root(folder):
+        """Use a built app's output folder when the site's own folder has no index.html."""
+        for sub in ("", "dist", "build", "public", "www"):
+            candidate = os.path.realpath(os.path.join(folder, sub))
+            if os.path.isfile(os.path.join(candidate, "index.html")):
+                return candidate
+        return os.path.realpath(folder)
+
+
 class DeviceSampler(threading.Thread):
     """Samples CPU / memory / network / temperature once a second."""
 
-    def __init__(self, metrics):
+    def __init__(self, metrics, load_test):
         super().__init__(daemon=True)
         self.metrics = metrics
-        self.cores = os.cpu_count() or 1
+        self.load_test = load_test
+        self.cores = load_test.cores
         self.temp = TempReader()
+        # Battery sensors run much cooler than CPU sensors, so they get lower limits.
+        self.temp_warn, self.temp_crit = (40, 46) if self.temp.kind == "battery" else (75, 90)
         self.prev_t = time.monotonic()
         self.prev_stat = read_proc_stat()
         self.prev_proc = process_cpu_seconds()
@@ -244,7 +442,7 @@ class DeviceSampler(threading.Thread):
         self.net_scope = "device" if self.prev_tx is not None else "process"
         mem = read_meminfo()
         self.ram_total = mem[0] if mem else None
-        self.latest = {"cpu": 0, "ramMB": mem[1] if mem else None, "netMbps": 0, "temp": self.temp.read()}
+        self.latest = {"cpu": 0, "burn": 0, "ramMB": mem[1] if mem else None, "netMbps": 0, "temp": self.temp.read()}
 
     def run(self):
         while True:
@@ -273,6 +471,10 @@ class DeviceSampler(threading.Thread):
             cpu = (proc - self.prev_proc) / dt / self.cores * 100
             self.prev_proc = proc
 
+        burn = self.load_test.cpu_seconds_since_last(dt) / dt / self.cores * 100
+        if self.cpu_scope == "process":
+            cpu += burn  # worker processes aren't part of this process's own CPU time
+
         own = self.metrics.bytes_sent
         sent = own - self.prev_own  # what our sites sent
         self.prev_own = own
@@ -284,11 +486,16 @@ class DeviceSampler(threading.Thread):
                 self.prev_tx = tx
 
         mem = read_meminfo()
+        temp = self.temp.read()
+        if temp is not None and temp >= self.temp_crit and self.load_test.active():
+            self.load_test.stop(f"Load test stopped early: temperature reached {temp:.0f} °C.")
+            print(f"Load test stopped: temperature {temp:.0f} °C")
         self.latest = {
             "cpu": max(0.0, min(100.0, cpu)),
+            "burn": max(0.0, min(100.0, burn)),
             "ramMB": mem[1] if mem else None,
             "netMbps": max(0, sent) * 8 / dt / 1e6,
-            "temp": self.temp.read(),
+            "temp": temp,
         }
 
 
@@ -316,48 +523,70 @@ class Handler(BaseHTTPRequestHandler):
         t0 = time.perf_counter()
         url = urlsplit(self.path)
         path = unquote(url.path)
-        host = (self.headers.get("Host") or "").split(":")[0].lower()
-        site, rel = self.app.route(host, path)
-
-        if site is None:
-            if path.startswith("/api/"):
-                return self.api(path, url.query)
-            if path == "/favicon.ico":
-                self.send_response(204)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-                return
-            if path in DASHBOARD_FILES and self.command in ("GET", "HEAD"):
-                return self.send_file(os.path.join(REPO, DASHBOARD_FILES[path]), cache=False)
-            return self.send_text(404, "Not found")
-
-        if rel is None:  # "/chess" -> "/chess/" so relative links work
-            status, nbytes = self.send_redirect(path + "/" + (("?" + url.query) if url.query else ""))
-        elif self.command not in ("GET", "HEAD"):
-            status, nbytes = self.send_text(405, "Method not allowed")
-        else:
-            status, nbytes = self.serve_site(site, rel)
-
+        site_id, status, nbytes = self.dispatch(url, path)
         shown = url.path + ("?" + url.query if url.query else "")
         self.app.metrics.record(
-            site["id"], self.client_address[0], self.command, shown[:160], status,
+            site_id, self.client_address[0], self.command, shown[:160], status,
             (time.perf_counter() - t0) * 1000, nbytes, time.thread_time() - cpu0,
         )
 
+    def dispatch(self, url, path):
+        """Answers the request and returns (site it belongs to, status, body bytes)."""
+        app = self.app
+        if path.startswith("/api/"):
+            return (TRAFFIC_SITE, *self.api(path, url.query))
+
+        site, rel = app.route(path)
+        if site is None:
+            # Apps built for "/" ask for /assets/... instead of /<site>/assets/...;
+            # the page that asked tells us which site it belongs to.
+            ref = self.referring_site()
+            if ref and path != "/" and self.site_file(ref, path):
+                return (ref["id"], *self.serve_site(ref, path))
+            if path == "/favicon.ico":
+                return (TRAFFIC_SITE, *self.send_bytes(204, b"", "image/x-icon"))
+            if path in DASHBOARD_FILES and self.command in ("GET", "HEAD"):
+                return (TRAFFIC_SITE, *self.send_file(os.path.join(REPO, DASHBOARD_FILES[path]), cache=False))
+            return (TRAFFIC_SITE, *self.send_text(404, "Not found"))
+
+        if rel is None:  # "/chessr" -> "/chessr/" so relative links work
+            return (site["id"], *self.send_redirect(url.path + "/" + (("?" + url.query) if url.query else "")))
+        if self.command not in ("GET", "HEAD"):
+            return (site["id"], *self.send_text(405, "Method not allowed"))
+        return (site["id"], *self.serve_site(site, rel))
+
     # -- sites
 
-    def serve_site(self, site, rel):
-        root = site["_root"]
+    def referring_site(self):
+        ref = self.headers.get("Referer")
+        if not ref:
+            return None
+        site, _ = self.app.route(unquote(urlsplit(ref).path))
+        return site
+
+    @staticmethod
+    def site_file(site, rel):
+        """Absolute path of rel inside the site, or None if it escapes or doesn't exist."""
+        root = site["root"]
         full = os.path.realpath(os.path.join(root, rel.lstrip("/")))
         if full != root and not full.startswith(root + os.sep):
-            return self.send_text(404, "Not found")
+            return None
         if os.path.isdir(full):
             full = os.path.join(full, "index.html")
-        if not os.path.isfile(full):
-            page = os.path.join(root, "404.html")
-            body = open(page, "rb").read() if os.path.isfile(page) else b"<h1>Page not found</h1>"
-            return self.send_bytes(404, body, "text/html; charset=utf-8")
-        return self.send_file(full, cache=True)
+        return full if os.path.isfile(full) else None
+
+    def serve_site(self, site, rel):
+        full = self.site_file(site, rel)
+        if full:
+            return self.send_file(full, cache=True)
+        root = site["root"]
+        last = rel.rstrip("/").rsplit("/", 1)[-1]
+        index = os.path.join(root, "index.html")
+        if "." not in last and "text/html" in (self.headers.get("Accept") or "") and os.path.isfile(index):
+            return self.send_file(index, cache=True)  # single-page app route like /chessr/lesson/3
+        page = os.path.join(root, "404.html")
+        body = open(page, "rb").read() if os.path.isfile(page) else b"<h1>Page not found</h1>"
+        return self.send_bytes(404, body, "text/html; charset=utf-8")
 
     # -- API
 
@@ -365,6 +594,23 @@ class Handler(BaseHTTPRequestHandler):
         app = self.app
         if path == "/api/config":
             return self.send_json(app.config_payload(self.headers.get("Host") or ""))
+        if path == "/api/loadtest":
+            if self.command != "POST":
+                return self.send_text(405, "Use POST")
+            q = parse_qs(query)
+            try:
+                seconds = float(q.get("seconds", ["15"])[0])
+            except ValueError:
+                seconds = 15
+            if seconds <= 0:
+                app.load_test.stop()
+            else:
+                valid = app.site_ids()
+                ids = [i for i in q.get("sites", [""])[0].split(",") if i in valid]
+                if not ids:
+                    return self.send_text(400, "Unknown site")
+                app.load_test.start(ids, seconds)
+            return self.send_json(app.load_test.status())
         if path == "/api/snapshot":
             try:
                 since = int(parse_qs(query).get("since", ["0"])[0])
@@ -425,29 +671,31 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class App:
-    def __init__(self, conf_path, port):
-        with open(conf_path) as f:
-            conf = json.load(f)
-        base = os.path.dirname(os.path.abspath(conf_path))
-        self.server_conf = conf.get("server", {})
-        self.sites = conf["sites"]
-        for site in self.sites:
-            site["_root"] = os.path.realpath(os.path.join(base, site["root"]))
-            if not os.path.isdir(site["_root"]):
-                raise SystemExit(f"Site folder not found for {site['id']}: {site['_root']}")
-        self.domains = {s["domain"].lower(): s for s in self.sites if s.get("domain")}
-        self.by_id = {s["id"]: s for s in self.sites}
-        self.port = port
-        self.metrics = Metrics(self.sites)
-        self.sampler = DeviceSampler(self.metrics)
+    def __init__(self, conf_path, sites_dir):
+        try:
+            with open(conf_path) as f:
+                self.server_conf = json.load(f)
+        except FileNotFoundError:
+            self.server_conf = {}
+        self.registry = SiteRegistry(sites_dir)
+        self.metrics = Metrics()
+        self.load_test = LoadTest(os.cpu_count() or 1)
+        self.sampler = DeviceSampler(self.metrics, self.load_test)
         self.sampler.start()
+        threading.Thread(target=self._watch_sites, daemon=True).start()
 
-    def route(self, host, path):
+    def _watch_sites(self):
+        while True:  # notices new/removed folders even when no dashboard is open
+            self.registry.sites()
+            time.sleep(1)
+
+    def site_ids(self):
+        return [TRAFFIC_SITE] + [s["id"] for s in self.registry.sites()]
+
+    def route(self, path):
         """Returns (site, path inside the site). path is None when a redirect to add '/' is needed."""
-        if host in self.domains:
-            return self.domains[host], path
         parts = path.split("/", 2)
-        site = self.by_id.get(parts[1]) if len(parts) > 1 else None
+        site = self.registry.get(parts[1]) if len(parts) > 1 and parts[1] else None
         if not site:
             return None, None
         if len(parts) == 2:
@@ -457,7 +705,7 @@ class App:
     def config_payload(self, host_header):
         s = self.sampler
         temp_kind = s.temp.kind
-        warn, crit = (40, 46) if temp_kind == "battery" else (75, 90)
+        warn, crit = s.temp_warn, s.temp_crit
         c = self.server_conf
         return {
             "live": True,
@@ -474,20 +722,30 @@ class App:
                 "tempKind": temp_kind,
                 "cpuScope": s.cpu_scope,
                 "netScope": s.net_scope,
-                "sites": [{
+                "sites": [
+                    {"id": TRAFFIC_SITE, "name": TRAFFIC_SITE, "domain": f"{host_header}/",
+                     "url": "/", "latencyMs": 15, "builtIn": True},
+                ] + [{
                     "id": site["id"],
-                    "name": site.get("name", site["id"]),
-                    "domain": site.get("domain") or f"{host_header}/{site['id']}/",
-                    "url": f"/{site['id']}/",
+                    "name": site["name"],
+                    "domain": f"{host_header}/{site['id']}/",
+                    "url": f"/{quote(site['id'])}/",
                     "latencyMs": 15,
-                } for site in self.sites],
+                } for site in self.registry.sites()],
             }],
+            "sitesVersion": self.registry.version,
         }
 
     def snapshot(self, since):
         s = self.sampler
         dev = s.latest
-        sites = self.metrics.sites_now(s.cores)
+        sites = self.metrics.sites_now(s.cores, self.site_ids())
+        test = self.load_test.status()
+        if test["sites"]:  # count the load test's CPU against the sites being tested
+            share = dev["burn"] / len(test["sites"])
+            for x in sites:
+                if x["id"] in test["sites"]:
+                    x["cpu"] += share
         n = sum(x["rps"] for x in sites)
         errors = sum(x["rps"] * x["errorRate"] for x in sites)
         site_cpu = sum(x["cpu"] for x in sites)
@@ -497,6 +755,7 @@ class App:
         return {
             "clockMinutes": lt.tm_hour * 60 + lt.tm_min + lt.tm_sec / 60,
             "seq": self.metrics.seq,
+            "sitesVersion": self.registry.version,
             "servers": [{
                 "id": self.server_conf.get("id", "server1"),
                 "cpu": cpu,
@@ -508,6 +767,7 @@ class App:
                 "net": min(100.0, dev["netMbps"] / net_cap * 100),
                 "temp": dev["temp"],
                 "visitors": self.metrics.unique_visitors(),
+                "loadTest": test,
                 "errorRate": errors / n if n else 0,
                 "sites": sites,
             }],
@@ -530,19 +790,30 @@ def main():
     parser = argparse.ArgumentParser(description="Host sites and show their real traffic on the dashboard.")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--host", default="0.0.0.0", help="address to listen on (default: all)")
-    parser.add_argument("--config", default=os.path.join(HERE, "sites.json"))
+    parser.add_argument("--config", default=os.path.join(HERE, "server.json"), help="server name and specs")
+    parser.add_argument("--sites", default=os.path.join(REPO, "sites"), help="folder whose sub-folders are the sites")
     args = parser.parse_args()
 
-    app = App(args.config, args.port)
+    app = App(args.config, args.sites)
     Handler.app = app
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
 
-    ip = lan_ip()
+    base = f"http://{lan_ip()}:{args.port}"
+
+    def announce(added, removed):
+        for name in added:
+            print(f"  + site added    {name:<14} {base}/{quote(name)}/")
+        for name in removed:
+            print(f"  - site removed  {name}")
+
+    app.registry.announce = announce
     s = app.sampler
-    print(f"\n  Dashboard   http://{ip}:{args.port}/")
-    for site in app.sites:
-        print(f"  {site.get('name', site['id']):<11} http://{ip}:{args.port}/{site['id']}/")
+    print(f"\n  {TRAFFIC_SITE:<14} {base}/   (this dashboard)")
+    for site in app.registry.sites():
+        print(f"  {site['name']:<14} {base}/{quote(site['id'])}/")
+    print(f"\n  Sites folder: {app.registry.dir}")
+    print("  Every folder in it is a site named after the folder. Changes show up within a second.")
     print(f"\n  CPU: {'whole device' if s.cpu_scope == 'device' else 'this server process (device CPU is hidden)'}"
           f" · network: {'whole device' if s.net_scope == 'device' else 'this server only'}"
           f" · temperature: {s.temp.kind or 'not available'}")
@@ -550,6 +821,7 @@ def main():
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
+        app.load_test.stop()
         print("\nStopped.")
 
 

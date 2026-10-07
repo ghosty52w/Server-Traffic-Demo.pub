@@ -424,6 +424,8 @@ main {
   .site-stats { grid-template-columns: repeat(3, minmax(0, auto)); }
 }
 
+.site-empty { list-style: none; color: var(--ink-2); font-size: 13px; padding: 10px 0; }
+
 /* meters */
 .meters { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 18px; margin-top: -2px; }
 .meter { --fill: var(--accent); min-width: 0; }

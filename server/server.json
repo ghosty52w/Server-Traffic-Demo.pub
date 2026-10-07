@@ -1,0 +1,7 @@
+{
+  "id": "phone",
+  "name": "Server 1",
+  "hardware": "Android phone",
+  "kind": "phone",
+  "netMbps": 100
+}
