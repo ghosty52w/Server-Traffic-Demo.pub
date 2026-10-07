@@ -20,6 +20,7 @@ on a Raspberry Pi, or on a PC.
 """
 import argparse
 import email.utils
+import errno
 import glob
 import http.client
 import json
@@ -958,7 +959,15 @@ def main():
 
     app = App(args.config, args.sites)
     Handler.app = app
-    public = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        public = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as exc:
+        if exc.errno in (errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", -1)):
+            raise SystemExit(
+                f"\n  Port {args.port} is already in use. Either the server is already running\n"
+                f"  (stop it with:  pkill -f '[t]raffic_server.py'), or another app uses this port\n"
+                f"  (start on another one with:  python server/traffic_server.py --port {args.port + 1}).\n")
+        raise
     public.daemon_threads = True
     workers = []
 
